@@ -1,0 +1,60 @@
+# Sealien MAVLink bridge runtime configuration.
+#
+# MSGID reference (protocol v1.5, worksheet: mavlink).
+# Use numeric MSGIDs in messages.rx/tx.
+# 0 HEARTBEAT, 1 IMU_DATA, 2 THRUSTER_STATUS, 3 GS_STATUS, 4 LED_STATUS
+# 5 VCHECK, 6 HEIGHT_STATUS, 7 DEPTH_STATUS, 8 BEM280, 9 SWITCH_STATUS
+# 10 THRUSTER_CMD, 11 THRUSTER_LOCK, 12 IMU_CALIB, 13 IMU_CLEAR
+# 14 LED_CMD, 15 GS_CMD, 16 GS_CFG, 17 SWITCH_CMD, 18 DVL_DATA
+# 19 MIXED_IO_CMD, 20 MIXED_IO_DATA, 21 VALVE_CMD, 22 VALVE_STATUS
+
+sealien_mavlink_bridge:
+  dialect: "tools/sealien_mavlink.xml"
+
+  host:
+    system_id: 1
+    component_id: 1
+    bind_ip: "0.0.0.0"
+    bind_port: 9999
+
+  # Timing policy for MSGID 0 HEARTBEAT.
+  # Heartbeat routing is controlled by each endpoint's messages.rx/tx:
+  # - rx contains 0: listen to heartbeat from that endpoint.
+  # - tx contains 0: send heartbeat to that endpoint.
+  heartbeat:
+    host_tx_hz: 1.0
+    endpoint_expected_hz: 1.0
+    endpoint_timeout_ms: 3000
+
+  endpoints:
+    - name: "nav_sensor_mcu"
+      enabled: true
+      system_id: 101
+      component_id: 1
+      remote_ip: "192.168.100.101"
+      remote_port: 9999
+      # A MSGID may appear in both rx and tx when a board supports
+      # bidirectional request/response or mirrored status/control frames.
+      messages:
+        rx: [0, 1, 5, 6, 7, 8, 18]
+        tx: [0, 12, 13]
+
+    - name: "actuator_mcu"
+      enabled: true
+      system_id: 102
+      component_id: 1
+      remote_ip: "192.168.100.102"
+      remote_port: 9999
+      messages:
+        rx: [0, 2, 3, 4, 9]
+        tx: [0, 10, 11, 14, 15, 16, 17]
+
+    - name: "io_valve_mcu"
+      enabled: true
+      system_id: 103
+      component_id: 1
+      remote_ip: "192.168.100.103"
+      remote_port: 9999
+      messages:
+        rx: [0, 20, 22]
+        tx: [0, 19, 21]

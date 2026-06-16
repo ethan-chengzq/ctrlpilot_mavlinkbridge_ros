@@ -1,0 +1,252 @@
+<?xml version="1.0"?>
+<mavlink>
+  <!--
+    Sealien MAVLink dialect for Sealien controller communication links.
+
+    Source protocol: doc/数据采集板通信协议1.5.xlsx
+    Transport: ROS host <-> STM32 lower controller over UDP MAVLink 2.0.
+
+    Message IDs and fields in this file are generated from the "mavlink"
+    worksheet of 数据采集板通信协议1.5.xlsx.
+    This dialect intentionally does not include common.xml because this project
+    uses a private HEARTBEAT at message ID 0.
+  -->
+  <version>2</version>
+  <dialect>201</dialect>
+
+  <messages>
+    <!-- Status telemetry: STM32 -> ROS host. -->
+    <message id="0" name="HEARTBEAT">
+      <description>Sealien data acquisition board heartbeat. Used by the ROS host to monitor STM32 online state and protocol version.</description>
+      <field type="uint32_t" name="timestamp_ms" units="ms">Timestamp from the sender clock.</field>
+      <field type="uint8_t" name="type">Device type or ROV type defined by the lower controller.</field>
+      <field type="uint8_t" name="system_status">System status code defined by the lower controller.</field>
+      <field type="uint8_t_mavlink_version" name="mavlink_version">MAVLink protocol version.</field>
+    </message>
+
+    <message id="1" name="IMU_DATA">
+      <description>Integrated IMU and DVL navigation data.</description>
+      <field type="uint32_t" name="timestamp_ms" units="ms">Timestamp from the sender clock.</field>
+      <field type="double" name="lon" units="deg">Longitude.</field>
+      <field type="double" name="lat" units="deg">Latitude.</field>
+      <field type="float" name="alt" units="m">Altitude.</field>
+      <field type="float" name="vel_n" units="m/s">North velocity.</field>
+      <field type="float" name="vel_e" units="m/s">East velocity.</field>
+      <field type="float" name="vel_u" units="m/s">Up or ground-referenced velocity, matching the STM32 protocol table.</field>
+      <field type="float" name="acc_x" units="m/s/s">X-axis acceleration.</field>
+      <field type="float" name="acc_y" units="m/s/s">Y-axis acceleration.</field>
+      <field type="float" name="acc_z" units="m/s/s">Z-axis acceleration.</field>
+      <field type="float" name="roll" units="deg">Roll angle.</field>
+      <field type="float" name="pitch" units="deg">Pitch angle.</field>
+      <field type="float" name="yaw" units="deg">Heading angle.</field>
+      <field type="float" name="gyro_x" units="deg/s">Roll angular velocity.</field>
+      <field type="float" name="gyro_y" units="deg/s">Pitch angular velocity.</field>
+      <field type="float" name="gyro_z" units="deg/s">Heading angular velocity.</field>
+      <field type="float" name="temp" units="degC">IMU temperature.</field>
+      <field type="int16_t" name="turns">IMU heading turn count; positive and negative values are valid.</field>
+      <field type="uint8_t" name="imu_status">IMU status code.</field>
+      <field type="uint8_t" name="fault">IMU fault code.</field>
+      <field type="uint8_t" name="is_calibrating">IMU calibration flag: 0 not calibrating, 1 calibrating.</field>
+      <field type="float" name="dvl_velx" units="m/s">DVL X-axis velocity.</field>
+      <field type="float" name="dvl_vely" units="m/s">DVL Y-axis velocity.</field>
+      <field type="float" name="dvl_velz" units="m/s">DVL Z-axis velocity.</field>
+      <field type="float" name="dvl_height" units="m">DVL altitude above bottom.</field>
+      <field type="uint8_t" name="dvl_status">DVL status code.</field>
+    </message>
+
+    <message id="2" name="THRUSTER_STATUS">
+      <description>Thruster status for up to 12 thrusters.</description>
+      <field type="uint32_t" name="timestamp_ms" units="ms">Timestamp from the sender clock.</field>
+      <field type="int16_t[12]" name="speed" units="rpm">Thruster speed feedback.</field>
+      <field type="int16_t[12]" name="power" units="W">Thruster power feedback.</field>
+      <field type="int16_t[12]" name="temp" units="degC">Thruster temperature feedback.</field>
+      <field type="uint8_t[12]" name="status">Thruster status code for each channel.</field>
+      <field type="uint8_t[12]" name="fault">Thruster fault code for each channel.</field>
+      <field type="uint8_t" name="lock">Thruster lock state: 0 unlocked, 1 locked.</field>
+    </message>
+
+    <message id="3" name="GS_STATUS">
+      <description>Gimbal servo status.</description>
+      <field type="uint32_t" name="timestamp_ms" units="ms">Timestamp from the sender clock.</field>
+      <field type="float[2]" name="angle" units="deg">Servo angle feedback: index 0 horizontal, index 1 pitch.</field>
+      <field type="int16_t[2]" name="step">Servo step feedback: index 0 horizontal, index 1 pitch.</field>
+      <field type="int16_t[2]" name="res">Reserved fields for future servo status expansion.</field>
+    </message>
+
+    <message id="4" name="LED_STATUS">
+      <description>LED PWM status for ten lighting channels.</description>
+      <field type="uint32_t" name="timestamp_ms" units="ms">Timestamp from the sender clock.</field>
+      <field type="uint8_t" name="ledpwm1" units="%" minValue="0" maxValue="100">LED channel 1 duty cycle.</field>
+      <field type="uint8_t" name="ledpwm2" units="%" minValue="0" maxValue="100">LED channel 2 duty cycle.</field>
+      <field type="uint8_t" name="ledpwm3" units="%" minValue="0" maxValue="100">LED channel 3 duty cycle.</field>
+      <field type="uint8_t" name="ledpwm4" units="%" minValue="0" maxValue="100">LED channel 4 duty cycle.</field>
+      <field type="uint8_t" name="ledpwm5" units="%" minValue="0" maxValue="100">LED channel 5 duty cycle.</field>
+      <field type="uint8_t" name="ledpwm6" units="%" minValue="0" maxValue="100">LED channel 6 duty cycle.</field>
+      <field type="uint8_t" name="ledpwm7" units="%" minValue="0" maxValue="100">LED channel 7 duty cycle.</field>
+      <field type="uint8_t" name="ledpwm8" units="%" minValue="0" maxValue="100">LED channel 8 duty cycle.</field>
+      <field type="uint8_t" name="ledpwm9" units="%" minValue="0" maxValue="100">LED channel 9 duty cycle.</field>
+      <field type="uint8_t" name="ledpwm10" units="%" minValue="0" maxValue="100">LED channel 10 duty cycle.</field>
+    </message>
+
+    <message id="5" name="VCHECK">
+      <description>ADC check data for water ingress and temperature channels.</description>
+      <field type="uint32_t" name="timestamp_ms" units="ms">Timestamp from the sender clock.</field>
+      <field type="uint8_t[4]" name="v_status">Water ingress detection state for four channels.</field>
+      <field type="int16_t[4]" name="temp" units="degC">Temperature detection data for four channels.</field>
+    </message>
+
+    <message id="6" name="HEIGHT_STATUS">
+      <description>Sonar altimeter target distance and strength data for five sonars.</description>
+      <field type="uint32_t" name="timestamp_ms" units="ms">Timestamp from the sender clock.</field>
+      <field type="uint16_t[5]" name="near_dist" units="cm">Nearest target distance.</field>
+      <field type="uint16_t[5]" name="near_stren">Nearest target strength.</field>
+      <field type="uint16_t[5]" name="far_dist" units="cm">Farthest target distance.</field>
+      <field type="uint16_t[5]" name="far_stren">Farthest target strength.</field>
+      <field type="uint16_t[5]" name="most_dist" units="cm">Strongest target distance.</field>
+      <field type="uint16_t[5]" name="most_stren">Strongest target strength.</field>
+    </message>
+
+    <message id="7" name="DEPTH_STATUS">
+      <description>Depth sensor data for up to four channels.</description>
+      <field type="uint32_t" name="timestamp_ms" units="ms">Timestamp from the sender clock.</field>
+      <field type="float[4]" name="depth" units="m">Depth values.</field>
+      <field type="float[4]" name="temp" units="degC">Temperature values.</field>
+    </message>
+
+    <message id="8" name="BEM280">
+      <description>Board-mounted BME280 temperature, humidity and pressure sensor data.</description>
+      <field type="uint32_t" name="timestamp_ms" units="ms">Timestamp from the sender clock.</field>
+      <field type="float" name="temp" units="degC">Temperature.</field>
+      <field type="float" name="humi" units="%">Relative humidity.</field>
+      <field type="float" name="press" units="hPa">Pressure.</field>
+    </message>
+
+    <message id="9" name="SWITCH_STATUS">
+      <description>Relay switch status feedback for eight channels.</description>
+      <field type="uint32_t" name="timestamp_ms" units="ms">Timestamp from the sender clock.</field>
+      <field type="uint8_t[8]" name="switchs">Relay states: 0 no power, 1 powered.</field>
+    </message>
+
+    <!-- Control commands: ROS host -> STM32. -->
+    <message id="10" name="THRUSTER_CMD">
+      <description>Thruster speed command for up to 12 thrusters. Command unit is defined by the configured thruster driver.</description>
+      <field type="uint16_t[12]" name="speed">Thruster speed command values.</field>
+    </message>
+
+    <message id="11" name="THRUSTER_LOCK">
+      <description>Thruster lock command.</description>
+      <field type="uint8_t" name="lock">Lock command: 0 unlock, 1 lock.</field>
+    </message>
+
+    <message id="12" name="IMU_CALIB">
+      <description>IMU calibration origin data.</description>
+      <field type="double" name="lon" units="deg">Longitude.</field>
+      <field type="double" name="lat" units="deg">Latitude.</field>
+      <field type="float" name="alt" units="m">Altitude.</field>
+    </message>
+
+    <message id="13" name="IMU_CLEAR">
+      <description>IMU turn counter clear command. The field value is ignored and only keeps the MAVLink payload non-empty.</description>
+      <field type="uint8_t" name="clear">Dummy command field.</field>
+    </message>
+
+    <message id="14" name="LED_CMD">
+      <description>LED PWM command.</description>
+      <field type="uint8_t" name="index">LED index, valid range 0-9.</field>
+      <field type="uint8_t" name="pwm" units="%" minValue="0" maxValue="100">LED duty cycle.</field>
+    </message>
+
+    <message id="15" name="GS_CMD">
+      <description>Gimbal servo angle command.</description>
+      <field type="uint8_t" name="index">Servo index: 0 horizontal, 1 pitch.</field>
+      <field type="float" name="angle" units="deg">Target servo angle.</field>
+    </message>
+
+    <message id="16" name="GS_CFG">
+      <description>Gimbal servo configuration command.</description>
+      <field type="float[2]" name="max_angle" units="deg">Servo maximum angle: index 0 horizontal, index 1 pitch.</field>
+      <field type="float[2]" name="min_angle" units="deg">Servo minimum angle: index 0 horizontal, index 1 pitch.</field>
+      <field type="uint16_t[2]" name="step">Servo step: index 0 horizontal, index 1 pitch.</field>
+    </message>
+
+    <message id="17" name="SWITCH_CMD">
+      <description>Relay switch command.</description>
+      <field type="uint8_t" name="index">Relay index, valid range 0-7.</field>
+      <field type="uint8_t" name="value">Relay command value from protocol table: 0 ON, 1 OFF.</field>
+    </message>
+
+    <message id="18" name="DVL_DATA">
+      <description>DVL bottom-track and water-profile data. Invalid velocity values follow the DVL manual convention where -32.768 m/s means invalid.</description>
+      <field type="uint32_t" name="timestamp_ms" units="ms">Timestamp from the sender clock.</field>
+      <field type="float[4]" name="BT_range" units="m">Bottom-track range for four beams; 0 means bad bottom range detection.</field>
+      <field type="float[4]" name="BT_vel" units="m/s">Bottom-track velocity for four beams. Beam meaning depends on DVL coordinate frame; common mapping is v1 east/Y, v2 north/X, v3 up/Z.</field>
+      <field type="uint8_t[4]" name="BT_percent_good" units="%" minValue="0" maxValue="100">Bottom-track percent-good for each beam.</field>
+      <field type="float" name="BT_max_depth" units="m">Maximum bottom-track depth, expected range 1-6553.5 m.</field>
+      <field type="float[4]" name="WP_Cell1_vel" units="m/s">Water-profile cell 1 velocity for four beams.</field>
+      <field type="uint8_t[4]" name="WP_Cell1_percent_good" units="%" minValue="0" maxValue="100">Water-profile cell 1 percent-good for each beam.</field>
+      <field type="float[4]" name="WP_Cell2_vel" units="m/s">Water-profile cell 2 velocity for four beams.</field>
+      <field type="uint8_t[4]" name="WP_Cell2_percent_good" units="%" minValue="0" maxValue="100">Water-profile cell 2 percent-good for each beam.</field>
+      <field type="float[4]" name="WP_Cell3_vel" units="m/s">Water-profile cell 3 velocity for four beams.</field>
+      <field type="uint8_t[4]" name="WP_Cell3_percent_good" units="%" minValue="0" maxValue="100">Water-profile cell 3 percent-good for each beam.</field>
+      <field type="float[4]" name="WP_Cell4_vel" units="m/s">Water-profile cell 4 velocity for four beams.</field>
+      <field type="uint8_t[4]" name="WP_Cell4_percent_good" units="%" minValue="0" maxValue="100">Water-profile cell 4 percent-good for each beam.</field>
+      <field type="float[4]" name="WP_Cell5_vel" units="m/s">Water-profile cell 5 velocity for four beams.</field>
+      <field type="uint8_t[4]" name="WP_Cell5_percent_good" units="%" minValue="0" maxValue="100">Water-profile cell 5 percent-good for each beam.</field>
+      <field type="float[4]" name="WP_Cell6_vel" units="m/s">Water-profile cell 6 velocity for four beams.</field>
+      <field type="uint8_t[4]" name="WP_Cell6_percent_good" units="%" minValue="0" maxValue="100">Water-profile cell 6 percent-good for each beam.</field>
+      <field type="float[4]" name="WP_Cell7_vel" units="m/s">Water-profile cell 7 velocity for four beams.</field>
+      <field type="uint8_t[4]" name="WP_Cell7_percent_good" units="%" minValue="0" maxValue="100">Water-profile cell 7 percent-good for each beam.</field>
+      <field type="float[4]" name="WP_Cell8_vel" units="m/s">Water-profile cell 8 velocity for four beams.</field>
+      <field type="uint8_t[4]" name="WP_Cell8_percent_good" units="%" minValue="0" maxValue="100">Water-profile cell 8 percent-good for each beam.</field>
+      <field type="float[4]" name="WP_Cell9_vel" units="m/s">Water-profile cell 9 velocity for four beams.</field>
+      <field type="uint8_t[4]" name="WP_Cell9_percent_good" units="%" minValue="0" maxValue="100">Water-profile cell 9 percent-good for each beam.</field>
+      <field type="float[4]" name="WP_Cell10_vel" units="m/s">Water-profile cell 10 velocity for four beams.</field>
+      <field type="uint8_t[4]" name="WP_Cell10_percent_good" units="%" minValue="0" maxValue="100">Water-profile cell 10 percent-good for each beam.</field>
+    </message>
+
+    <message id="19" name="MIXED_IO_CMD">
+      <description>Mixed IO board write command for GPIO output and DAC voltage channels.</description>
+      <field type="uint32_t" name="gpio_1_32_output">GPIO outputs 1-32 bitmap. Bit 0 maps to GPIO 1; bit value 0 drives low and 1 drives high.</field>
+      <field type="uint32_t" name="gpio_33_64_output">GPIO outputs 33-64 bitmap. Bit 0 maps to GPIO 33; bit value 0 drives low and 1 drives high.</field>
+      <field type="float[4]" name="dac_dev1_Vout" units="V">DAC device 1 output voltage: indexes 0-3 map to Vout_A through Vout_D.</field>
+      <field type="float[4]" name="dac_dev2_Vout" units="V">DAC device 2 output voltage: indexes 0-3 map to Vout_A through Vout_D.</field>
+      <field type="float[4]" name="dac_dev3_Vout" units="V">DAC device 3 output voltage: indexes 0-3 map to Vout_A through Vout_D.</field>
+    </message>
+
+    <message id="20" name="MIXED_IO_DATA">
+      <description>Mixed IO board readback data for GPIO output, GPIO input, DAC voltage and ADC voltage channels.</description>
+      <field type="uint32_t" name="timestamp_ms" units="ms">Timestamp from the sender clock.</field>
+      <field type="uint32_t" name="gpio_1_32_output">GPIO outputs 1-32 state bitmap. Bit 0 maps to GPIO 1; bit value 0 is low and 1 is high.</field>
+      <field type="uint32_t" name="gpio_33_64_output">GPIO outputs 33-64 state bitmap. Bit 0 maps to GPIO 33; bit value 0 is low and 1 is high.</field>
+      <field type="uint32_t" name="gpio_1_32_input">GPIO inputs 1-32 state bitmap. Bit 0 maps to GPIO 1; bit value 0 is low and 1 is high.</field>
+      <field type="uint32_t" name="gpio_33_64_input">GPIO inputs 33-64 state bitmap. Bit 0 maps to GPIO 33; bit value 0 is low and 1 is high.</field>
+      <field type="float[4]" name="dac_dev1_Vout" units="V">DAC device 1 current output voltage: indexes 0-3 map to Vout_A through Vout_D.</field>
+      <field type="float[4]" name="dac_dev2_Vout" units="V">DAC device 2 current output voltage: indexes 0-3 map to Vout_A through Vout_D.</field>
+      <field type="float[4]" name="dac_dev3_Vout" units="V">DAC device 3 current output voltage: indexes 0-3 map to Vout_A through Vout_D.</field>
+      <field type="float[8]" name="adc_dev1_Vin" units="V">ADC device 1 input voltage: indexes 0-7 map to AI1 through AI8.</field>
+      <field type="float[8]" name="adc_dev2_Vin" units="V">ADC device 2 input voltage: indexes 0-7 map to AI1 through AI8.</field>
+      <field type="float[8]" name="adc_dev3_Vin" units="V">ADC device 3 input voltage: indexes 0-7 map to AI1 through AI8.</field>
+    </message>
+
+    <message id="21" name="VALVE_CMD">
+      <description>Valve control board command from host to MCU. Covers 32-channel sensor power, 40-channel target current and 40-channel frequency. The MCU forwards valid values to the MVPE board over Modbus RTU.</description>
+      <field type="uint32_t" name="timestamp_ms" units="ms">Timestamp from the sender clock.</field>
+      <field type="uint32_t" name="sensor_power_mask">32-channel 24 V sensor power bitmap, bit 0 maps to channel 1. 0xFFFFFFFF means do not update sensor power.</field>
+      <field type="int16_t[40]" name="current_ma" units="mA">Target current for 40 valves. Valid range is 0-1500 mA; -1 skips that valve in sparse frames.</field>
+      <field type="uint16_t[40]" name="freq_hz" units="Hz">Target frequency for 40 valves. Valid range is 110-2500 Hz; 0 skips that valve in sparse frames.</field>
+    </message>
+
+    <message id="22" name="VALVE_STATUS">
+      <description>Valve control board feedback from MCU to host. Values are decoded from the MVPE Modbus register map documented in the protocol workbook.</description>
+      <field type="uint32_t" name="timestamp_ms" units="ms">Timestamp from the sender clock.</field>
+      <field type="uint16_t[40]" name="valve_current_x10">Valve current readback in 10 mA units. Source: Modbus registers 2-21.</field>
+      <field type="uint8_t[40]" name="valve_state">Valve state for 40 valves: 0 normal, 2 alarm, 3 offline. Source: Modbus registers 56-60.</field>
+      <field type="int32_t[2]" name="encoder">Encoder 1 and encoder 2 counts. Source: Modbus registers 46-49.</field>
+      <field type="uint16_t[24]" name="sensor_data">Analog sensor 1-24 raw values. Source: Modbus registers 22-45.</field>
+      <field type="uint16_t" name="water_in_mv" units="mV">Water ingress sensor voltage. Source: Modbus register 51.</field>
+      <field type="uint16_t" name="board_voltage_mv" units="mV">Board supply voltage. Source: Modbus register 55.</field>
+      <field type="int16_t[3]" name="temp_x10">Temperature channels 1, 2 and board temperature in 0.1 degC units. Source: Modbus registers 52-54.</field>
+    </message>
+
+  </messages>
+</mavlink>

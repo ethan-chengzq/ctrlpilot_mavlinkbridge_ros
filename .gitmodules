@@ -1,0 +1,3 @@
+[submodule "tools/mavlink"]
+	path = tools/mavlink
+	url = https://github.com/mavlink/mavlink.git
