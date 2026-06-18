@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstring>
+#include <sstream>
 #include <stdexcept>
 
 #include <arpa/inet.h>
@@ -255,6 +256,15 @@ bool MavlinkBridgeCore::reload_config(std::string * message)
       publishers_.clear();
       subscriptions_.clear();
     }
+    {
+      std::lock_guard<std::mutex> lock(endpoint_state_mutex_);
+      endpoint_states_.clear();
+      for (const auto & endpoint : next.endpoints) {
+        if (endpoint.enabled) {
+          endpoint_states_.emplace(endpoint.name, EndpointRuntimeState{});
+        }
+      }
+    }
     rebuild_ros_routes(next);
 
     if (std::filesystem::exists(config_file_)) {
@@ -269,6 +279,19 @@ bool MavlinkBridgeCore::reload_config(std::string * message)
       "Loaded MAVLink config %s with %zu endpoints",
       config_file_.c_str(),
       next.endpoints.size());
+    for (const auto & endpoint : next.endpoints) {
+      RCLCPP_INFO(
+        get_logger(),
+        "Configured endpoint=%s enabled=%s ip=%s:%u sysid=%u compid=%u rx=%s tx=%s",
+        endpoint.name.c_str(),
+        endpoint.enabled ? "true" : "false",
+        endpoint.remote_ip.c_str(),
+        endpoint.remote_port,
+        endpoint.system_id,
+        endpoint.component_id,
+        msgid_set_to_string(endpoint.rx).c_str(),
+        msgid_set_to_string(endpoint.tx).c_str());
+    }
     return true;
   } catch (const std::exception & e) {
     if (message) {
@@ -404,6 +427,85 @@ void MavlinkBridgeCore::rx_loop()
   }
 }
 
+void MavlinkBridgeCore::record_rx_message(
+  const EndpointConfig & endpoint,
+  const mavlink_message_t & msg,
+  const sockaddr_in & src_addr)
+{
+  const auto now = std::chrono::steady_clock::now();
+  const auto src_ip = ip_to_string(src_addr);
+  bool link_up = false;
+
+  {
+    std::lock_guard<std::mutex> lock(endpoint_state_mutex_);
+    auto & state = endpoint_states_[endpoint.name];
+
+    if (!state.connected) {
+      state.connected = true;
+      link_up = true;
+    }
+
+    state.last_rx = now;
+  }
+
+  if (link_up) {
+    RCLCPP_INFO(
+      get_logger(),
+      "MAVLink link up: endpoint=%s peer=%s configured=%s:%u sysid=%u compid=%u first_msgid=%u tx=%s rx=%s",
+      endpoint.name.c_str(),
+      src_ip.c_str(),
+      endpoint.remote_ip.c_str(),
+      endpoint.remote_port,
+      endpoint.system_id,
+      endpoint.component_id,
+      msg.msgid,
+      msgid_set_to_string(endpoint.tx).c_str(),
+      msgid_set_to_string(endpoint.rx).c_str());
+  }
+}
+
+void MavlinkBridgeCore::check_endpoint_timeouts()
+{
+  BridgeConfig config;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    config = config_;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  const auto timeout = std::chrono::milliseconds(config.endpoint_timeout_ms);
+
+  std::lock_guard<std::mutex> lock(endpoint_state_mutex_);
+  for (const auto & endpoint : config.endpoints) {
+    if (!endpoint.enabled) {
+      continue;
+    }
+
+    auto & state = endpoint_states_[endpoint.name];
+    if (!state.connected) {
+      continue;
+    }
+
+    const auto elapsed_since_rx = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now - state.last_rx);
+    if (state.last_rx.time_since_epoch().count() != 0 && elapsed_since_rx > timeout) {
+      RCLCPP_WARN(
+        get_logger(),
+        "MAVLink link down: endpoint=%s peer=%s:%u sysid=%u compid=%u no_rx_ms=%lld tx=%s rx=%s",
+        endpoint.name.c_str(),
+        endpoint.remote_ip.c_str(),
+        endpoint.remote_port,
+        endpoint.system_id,
+        endpoint.component_id,
+        static_cast<long long>(elapsed_since_rx.count()),
+        msgid_set_to_string(endpoint.tx).c_str(),
+        msgid_set_to_string(endpoint.rx).c_str());
+      state.connected = false;
+      continue;
+    }
+  }
+}
+
 void MavlinkBridgeCore::handle_mavlink_message(
   const mavlink_message_t & msg,
   const sockaddr_in & src_addr)
@@ -446,6 +548,7 @@ void MavlinkBridgeCore::handle_mavlink_message(
     return;
   }
 
+  record_rx_message(*endpoint, msg, src_addr);
   publish_rx_message(*endpoint, msg);
 }
 
@@ -458,6 +561,7 @@ void MavlinkBridgeCore::heartbeat_timer_callback()
   }
 
   if (config.heartbeat_host_tx_hz <= 0.0) {
+    check_endpoint_timeouts();
     return;
   }
 
@@ -491,6 +595,8 @@ void MavlinkBridgeCore::heartbeat_timer_callback()
       &heartbeat);
     (void)send_message_to_endpoint_unchecked(endpoint, mav_msg);
   }
+
+  check_endpoint_timeouts();
 }
 
 void MavlinkBridgeCore::config_reload_timer_callback()
@@ -1211,6 +1317,22 @@ std::string MavlinkBridgeCore::msgid_topic_name(uint32_t msgid)
     return static_cast<char>(std::tolower(c));
   });
   return name;
+}
+
+std::string MavlinkBridgeCore::msgid_set_to_string(const std::set<uint32_t> & ids)
+{
+  std::ostringstream oss;
+  oss << "[";
+  bool first = true;
+  for (const auto msgid : ids) {
+    if (!first) {
+      oss << ",";
+    }
+    first = false;
+    oss << msgid;
+  }
+  oss << "]";
+  return oss.str();
 }
 
 bool MavlinkBridgeCore::is_supported_msgid(uint32_t msgid)

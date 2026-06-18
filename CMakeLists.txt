@@ -46,13 +46,31 @@ add_executable(tms_mavlink_node src/tms_mavlink_node.cpp)
 target_link_libraries(tms_mavlink_node ${PROJECT_NAME}_core)
 ament_target_dependencies(tms_mavlink_node rclcpp)
 
+add_executable(rov_mavlink_test_node src/rov_mavlink_test_node.cpp)
+target_link_libraries(rov_mavlink_test_node yaml-cpp)
+ament_target_dependencies(
+  rov_mavlink_test_node
+  ament_index_cpp
+  rclcpp
+  std_msgs
+  geometry_msgs
+  sealien_ctrlpilot_msgmanagement
+)
+target_compile_features(rov_mavlink_test_node PUBLIC cxx_std_17)
+
 install(TARGETS
   ${PROJECT_NAME}_core
   rov_mavlink_node
   tms_mavlink_node
+  rov_mavlink_test_node
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
+install(PROGRAMS
+  scripts/start_rov_mavlink_test.sh
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 install(DIRECTORY include/
@@ -62,6 +80,15 @@ install(DIRECTORY include/
 install(DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config
 )
+
+install(DIRECTORY launch/
+  DESTINATION share/${PROJECT_NAME}/launch
+  PATTERN "__pycache__" EXCLUDE
+)
+
+# install(DIRECTORY docs/
+#   DESTINATION share/${PROJECT_NAME}/docs
+# )
 
 install(DIRECTORY lib/
   DESTINATION share/${PROJECT_NAME}/lib

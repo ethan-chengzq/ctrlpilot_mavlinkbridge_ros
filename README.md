@@ -8,6 +8,10 @@
   ROV 节点入口，默认加载 `config/sealien_mavlink_rov.yaml`，Topic 前缀为 `rov`。
 - `src/tms_mavlink_node.cpp`
   TMS 节点入口，默认加载 `config/sealien_mavlink_tms.yaml`，Topic 前缀为 `tms`。
+- `src/rov_mavlink_test_node.cpp`
+  ROV 通信联调测试节点，读取 `config/sealien_mavlink_rov.yaml`，按配置中的 `messages.tx/rx` 自动创建测试发布和接收镜像。
+- `docs/rov_mavlink_comm_test_case.md`
+  ROV MAVLink 通信测试用例，说明 ROS 与 STM32 联调步骤、预期现象、节点切换和扩展方法。
 - `include/sealien_ctrlpilot_mavlinkbridge/mavlink_bridge_core.hpp`
   桥接核心类声明，包括配置结构、线程状态、ROS publisher/subscriber 和 UDP socket 成员。
 - `src/mavlink_bridge_core.cpp`
@@ -34,6 +38,48 @@ ros2 run sealien_ctrlpilot_mavlinkbridge rov_mavlink_node --ros-args \
   -p config_file:=/path/to/sealien_mavlink_rov.yaml \
   -p topic_prefix:=rov
 ```
+
+ROV 三板联调测试节点需要和 `rov_mavlink_node` 同时运行。测试节点不直接打开 UDP 端口，而是通过桥接节点的 ROS Topic 触发 MAVLink 下发并接收桥接后的上发消息：
+
+```bash
+source install/setup.bash
+ros2 launch sealien_ctrlpilot_mavlinkbridge rov_mavlink_test.launch.py
+```
+
+只测试 101 节点：
+
+```bash
+ros2 launch sealien_ctrlpilot_mavlinkbridge rov_mavlink_test.launch.py \
+  target_endpoints:="['nav_sensor_mcu']"
+```
+
+也可以用脚本快捷入口：
+
+```bash
+ros2 run sealien_ctrlpilot_mavlinkbridge start_rov_mavlink_test.sh -- \
+  --endpoints nav_sensor_mcu
+```
+
+常用参数：
+
+```bash
+ros2 run sealien_ctrlpilot_mavlinkbridge rov_mavlink_test_node --ros-args \
+  -p tx_period_ms:=1000 \
+  -p safe_mode:=true \
+  -p include_heartbeat_tx:=false \
+  -p target_endpoints:="['nav_sensor_mcu','actuator_mcu','io_valve_mcu']"
+```
+
+测试节点输出：
+
+```text
+rov/test/tx_events                         # 每次测试下发事件
+rov/test/rx_events                         # 每次收到下位机上发事件
+rov/test/rx_summary                        # 1 Hz 接收计数汇总
+rov/test/from_mcu/<endpoint>/<message>     # 下位机上发消息的测试镜像 Topic
+```
+
+`safe_mode=true` 时，推进器、继电器、阀控、混合 IO 等测试载荷使用锁定、关闭或零输出值，适合先验证链路。需要硬件动作测试时再显式关闭 `safe_mode`，并确认现场条件允许。
 
 ## Topic 约定
 
@@ -132,6 +178,27 @@ endpoints:
 - 新配置会先尝试打开并绑定新的 UDP socket。
 - 只有 socket 成功后才替换当前配置和 ROS 路由。
 - 如果新配置端口冲突或格式错误，旧运行状态不会被破坏。
+
+ROS 端测试节点需要和桥接节点一起启动。
+先启动 ROV MAVLink 桥接节点：
+source install/setup.bash
+
+ros2 run sealien_ctrlpilot_mavlinkbridge rov_mavlink_node --ros-args \
+  -p config_file:=/home/se113/SLWS/SealienDCN/src/sealien_ctrlpilot_mavlinkbridge/config/sealien_mavlink_rov.yaml \
+  -p topic_prefix:=rov \
+  -p auto_reload:=true
+再启动 ROS 端测试节点：
+source install/setup.bash
+
+ros2 run sealien_ctrlpilot_mavlinkbridge rov_mavlink_test_node --ros-args \
+  -p config_file:=/home/se113/SLWS/SealienDCN/src/sealien_ctrlpilot_mavlinkbridge/config/sealien_mavlink_rov.yaml \
+  -p topic_prefix:=rov \
+  -p tx_period_ms:=1000 \
+  -p quality_report_period_sec:=5 \
+  -p quality_link_timeout_ms:=3000 \
+  -p include_heartbeat_tx:=false \
+  -p log_quality_report:=true \
+  -p safe_mode:=true
 
 ## C/C++ 维护要点
 

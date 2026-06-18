@@ -99,6 +99,12 @@ public:
 private:
   using ReloadService = sealien_ctrlpilot_msgmanagement::srv::ReloadMavlinkConfig;
 
+  struct EndpointRuntimeState
+  {
+    bool connected{false};
+    std::chrono::steady_clock::time_point last_rx{};
+  };
+
   BridgeConfig load_config_file(const std::string & path) const;
   bool reload_config(std::string * message);
   void rebuild_ros_routes(const BridgeConfig & config);
@@ -107,6 +113,11 @@ private:
   void close_udp_socket();
   void rx_loop();
   void handle_mavlink_message(const mavlink_message_t & msg, const sockaddr_in & src_addr);
+  void record_rx_message(
+    const EndpointConfig & endpoint,
+    const mavlink_message_t & msg,
+    const sockaddr_in & src_addr);
+  void check_endpoint_timeouts();
 
   void heartbeat_timer_callback();
   void config_reload_timer_callback();
@@ -160,6 +171,7 @@ private:
   static std::string msgid_name(uint32_t msgid);
   static std::string msgid_topic_name(uint32_t msgid);
   static bool is_supported_msgid(uint32_t msgid);
+  static std::string msgid_set_to_string(const std::set<uint32_t> & ids);
 
   std::string default_config_file_;
   std::string config_file_;
@@ -175,6 +187,9 @@ private:
   BridgeConfig config_;
   std::unordered_map<std::string, rclcpp::PublisherBase::SharedPtr> publishers_;
   std::vector<rclcpp::SubscriptionBase::SharedPtr> subscriptions_;
+
+  mutable std::mutex endpoint_state_mutex_;
+  std::unordered_map<std::string, EndpointRuntimeState> endpoint_states_;
 
   // Protects the POSIX UDP socket shared by receive thread, send callbacks and
   // config reload. Keep this separate from state_mutex_ to avoid long lock chains.
