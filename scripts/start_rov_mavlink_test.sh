@@ -7,10 +7,15 @@ CONFIG_FILE="${CONFIG_FILE:-}"
 TOPIC_PREFIX="${TOPIC_PREFIX:-rov}"
 TARGET_ENDPOINTS="${TARGET_ENDPOINTS:-}"
 TX_PERIOD_MS="${TX_PERIOD_MS:-1000}"
-QUALITY_REPORT_PERIOD_SEC="${QUALITY_REPORT_PERIOD_SEC:-5}"
+TX_SCHEDULER_PERIOD_MS="${TX_SCHEDULER_PERIOD_MS:-5}"
+USE_STRESS_RATES="${USE_STRESS_RATES:-true}"
+QUALITY_REPORT_PERIOD_SEC="${QUALITY_REPORT_PERIOD_SEC:-60}"
+BRIEF_REPORT_PERIOD_SEC="${BRIEF_REPORT_PERIOD_SEC:-5}"
+DETAIL_REPORT_PERIOD_SEC="${DETAIL_REPORT_PERIOD_SEC:-${QUALITY_REPORT_PERIOD_SEC}}"
 QUALITY_LINK_TIMEOUT_MS="${QUALITY_LINK_TIMEOUT_MS:-3000}"
 INCLUDE_HEARTBEAT_TX="${INCLUDE_HEARTBEAT_TX:-false}"
 LOG_QUALITY_REPORT="${LOG_QUALITY_REPORT:-true}"
+PUBLISH_PER_MESSAGE_EVENTS="${PUBLISH_PER_MESSAGE_EVENTS:-false}"
 SAFE_MODE="${SAFE_MODE:-true}"
 AUTO_RELOAD="${AUTO_RELOAD:-true}"
 
@@ -30,18 +35,25 @@ Options:
   --config FILE             YAML config file. Default: installed/source sealien_mavlink_rov.yaml
   --prefix NAME             ROS topic prefix. Default: ${TOPIC_PREFIX}
   --endpoints LIST          Target endpoint list. Example: nav_sensor_mcu,actuator_mcu
-  --tx-period-ms N          Test TX publish period. Default: ${TX_PERIOD_MS}
-  --quality-period-sec N    Quality report period. Default: ${QUALITY_REPORT_PERIOD_SEC}
+  --tx-period-ms N          Legacy TX publish period when stress rates are disabled. Default: ${TX_PERIOD_MS}
+  --tx-scheduler-ms N       Stress scheduler tick. Default: ${TX_SCHEDULER_PERIOD_MS}
+  --no-stress-rates         Disable MSGID-based stress rates and use --tx-period-ms for all routes.
+  --brief-period-sec N      Brief report period. Default: ${BRIEF_REPORT_PERIOD_SEC}
+  --detail-period-sec N     Detailed report period. Default: ${DETAIL_REPORT_PERIOD_SEC}
+  --quality-period-sec N    Legacy alias for --detail-period-sec.
   --timeout-ms N            Link timeout for test quality monitor. Default: ${QUALITY_LINK_TIMEOUT_MS}
   --include-heartbeat-tx    Let test node publish heartbeat topics too. Default: false
   --no-quality-log          Disable test node terminal quality report. Default: enabled
+  --publish-events          Publish per-frame rx_events/tx_events. Default: disabled
   --unsafe                  Disable safe_mode test payloads. Default: safe_mode=true
   --no-auto-reload          Disable bridge YAML auto reload. Default: enabled
   -h, --help                Show this help
 
 Environment overrides:
-  CONFIG_FILE TOPIC_PREFIX TARGET_ENDPOINTS TX_PERIOD_MS QUALITY_REPORT_PERIOD_SEC
-  QUALITY_LINK_TIMEOUT_MS INCLUDE_HEARTBEAT_TX LOG_QUALITY_REPORT SAFE_MODE AUTO_RELOAD
+  CONFIG_FILE TOPIC_PREFIX TARGET_ENDPOINTS TX_PERIOD_MS TX_SCHEDULER_PERIOD_MS
+  USE_STRESS_RATES BRIEF_REPORT_PERIOD_SEC DETAIL_REPORT_PERIOD_SEC
+  QUALITY_LINK_TIMEOUT_MS INCLUDE_HEARTBEAT_TX LOG_QUALITY_REPORT
+  PUBLISH_PER_MESSAGE_EVENTS SAFE_MODE AUTO_RELOAD
 
 Examples:
   # Test all enabled endpoints in YAML.
@@ -125,8 +137,26 @@ while [[ $# -gt 0 ]]; do
       TX_PERIOD_MS="${2:-}"
       shift 2
       ;;
+    --tx-scheduler-ms)
+      TX_SCHEDULER_PERIOD_MS="${2:-}"
+      shift 2
+      ;;
+    --no-stress-rates)
+      USE_STRESS_RATES="false"
+      shift
+      ;;
+    --brief-period-sec)
+      BRIEF_REPORT_PERIOD_SEC="${2:-}"
+      shift 2
+      ;;
+    --detail-period-sec)
+      DETAIL_REPORT_PERIOD_SEC="${2:-}"
+      QUALITY_REPORT_PERIOD_SEC="${DETAIL_REPORT_PERIOD_SEC}"
+      shift 2
+      ;;
     --quality-period-sec)
-      QUALITY_REPORT_PERIOD_SEC="${2:-}"
+      DETAIL_REPORT_PERIOD_SEC="${2:-}"
+      QUALITY_REPORT_PERIOD_SEC="${DETAIL_REPORT_PERIOD_SEC}"
       shift 2
       ;;
     --timeout-ms)
@@ -139,6 +169,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-quality-log)
       LOG_QUALITY_REPORT="false"
+      shift
+      ;;
+    --publish-events)
+      PUBLISH_PER_MESSAGE_EVENTS="true"
       shift
       ;;
     --unsafe)
@@ -190,10 +224,15 @@ test_cmd=(
   -p "topic_prefix:=${TOPIC_PREFIX}"
   "${endpoint_param[@]}"
   -p "tx_period_ms:=${TX_PERIOD_MS}"
+  -p "tx_scheduler_period_ms:=${TX_SCHEDULER_PERIOD_MS}"
+  -p "use_stress_rates:=${USE_STRESS_RATES}"
   -p "quality_report_period_sec:=${QUALITY_REPORT_PERIOD_SEC}"
+  -p "brief_report_period_sec:=${BRIEF_REPORT_PERIOD_SEC}"
+  -p "detail_report_period_sec:=${DETAIL_REPORT_PERIOD_SEC}"
   -p "quality_link_timeout_ms:=${QUALITY_LINK_TIMEOUT_MS}"
   -p "include_heartbeat_tx:=${INCLUDE_HEARTBEAT_TX}"
   -p "log_quality_report:=${LOG_QUALITY_REPORT}"
+  -p "publish_per_message_events:=${PUBLISH_PER_MESSAGE_EVENTS}"
   -p "safe_mode:=${SAFE_MODE}"
 )
 
@@ -202,7 +241,10 @@ echo "  config=${CONFIG_FILE}"
 echo "  prefix=${TOPIC_PREFIX}"
 echo "  endpoints=${TARGET_ENDPOINTS:-all enabled endpoints}"
 echo "  tx_period_ms=${TX_PERIOD_MS}"
-echo "  quality_period_sec=${QUALITY_REPORT_PERIOD_SEC}"
+echo "  tx_scheduler_period_ms=${TX_SCHEDULER_PERIOD_MS}"
+echo "  use_stress_rates=${USE_STRESS_RATES}"
+echo "  brief_report_period_sec=${BRIEF_REPORT_PERIOD_SEC}"
+echo "  detail_report_period_sec=${DETAIL_REPORT_PERIOD_SEC}"
 echo "  timeout_ms=${QUALITY_LINK_TIMEOUT_MS}"
 echo
 echo "Starting bridge node..."

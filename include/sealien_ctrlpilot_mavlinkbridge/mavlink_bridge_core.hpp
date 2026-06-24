@@ -16,6 +16,7 @@
 #include <netinet/in.h>
 
 #include "rclcpp/rclcpp.hpp"
+#include "std_msgs/msg/string.hpp"
 
 #include "sealien_ctrlpilot_msgmanagement/msg/bme280_status.hpp"
 #include "sealien_ctrlpilot_msgmanagement/msg/depth_status.hpp"
@@ -105,6 +106,16 @@ private:
     std::chrono::steady_clock::time_point last_rx{};
   };
 
+  struct TxCounter
+  {
+    uint64_t success{0};
+    uint64_t failure{0};
+    uint64_t bytes{0};
+    uint64_t window_success{0};
+    uint64_t window_failure{0};
+    uint64_t window_bytes{0};
+  };
+
   BridgeConfig load_config_file(const std::string & path) const;
   bool reload_config(std::string * message);
   void rebuild_ros_routes(const BridgeConfig & config);
@@ -121,6 +132,7 @@ private:
 
   void heartbeat_timer_callback();
   void config_reload_timer_callback();
+  void tx_stats_timer_callback();
   void reload_service_callback(
     const std::shared_ptr<ReloadService::Request> request,
     std::shared_ptr<ReloadService::Response> response);
@@ -138,6 +150,11 @@ private:
   bool send_message_to_endpoint_unchecked(
     const EndpointConfig & endpoint,
     const mavlink_message_t & msg);
+  void record_tx_result(
+    const EndpointConfig & endpoint,
+    uint32_t msgid,
+    bool success,
+    uint16_t bytes_written);
 
   void create_rx_publisher(const EndpointConfig & endpoint, uint32_t msgid);
   void create_tx_subscription(const EndpointConfig & endpoint, uint32_t msgid);
@@ -180,6 +197,12 @@ private:
   bool strict_remote_ip_{false};
   uint8_t heartbeat_type_{1};
   uint8_t heartbeat_system_status_{0};
+  std::size_t ros_queue_depth_{100};
+  int udp_recv_buffer_bytes_{262144};
+  int udp_send_buffer_bytes_{262144};
+  int rx_idle_sleep_ms_{1};
+  bool enable_tx_stats_{true};
+  int tx_stats_period_sec_{60};
 
   // Protects configuration and ROS communication handles while config reload
   // can rebuild routes concurrently with receive callbacks.
@@ -196,6 +219,9 @@ private:
   mutable std::mutex socket_mutex_;
   int socket_fd_{-1};
 
+  mutable std::mutex tx_stats_mutex_;
+  std::unordered_map<std::string, TxCounter> tx_counters_;
+
   // MAVLink parser state is used only by rx_thread_.
   std::atomic<bool> running_{false};
   std::thread rx_thread_;
@@ -204,9 +230,11 @@ private:
 
   rclcpp::TimerBase::SharedPtr heartbeat_timer_;
   rclcpp::TimerBase::SharedPtr config_reload_timer_;
+  rclcpp::TimerBase::SharedPtr tx_stats_timer_;
   rclcpp::Service<ReloadService>::SharedPtr reload_service_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr tx_stats_pub_;
   std::filesystem::file_time_type config_mtime_{};
-  std::chrono::steady_clock::time_point last_heartbeat_tx_{};
+  std::chrono::steady_clock::time_point next_heartbeat_tx_{};
 };
 
 }  // namespace sealien_ctrlpilot_mavlinkbridge

@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstring>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 
@@ -112,6 +113,12 @@ MavlinkBridgeCore::MavlinkBridgeCore(
   declare_parameter<bool>("strict_remote_ip", false);
   declare_parameter<int>("heartbeat_type", 1);
   declare_parameter<int>("heartbeat_system_status", 0);
+  declare_parameter<int>("ros_queue_depth", 100);
+  declare_parameter<int>("udp_recv_buffer_bytes", 262144);
+  declare_parameter<int>("udp_send_buffer_bytes", 262144);
+  declare_parameter<int>("rx_idle_sleep_ms", 1);
+  declare_parameter<bool>("enable_tx_stats", true);
+  declare_parameter<int>("tx_stats_period_sec", 60);
 
   config_file_ = get_parameter("config_file").as_string();
   topic_prefix_ = trim_slashes(get_parameter("topic_prefix").as_string());
@@ -120,6 +127,17 @@ MavlinkBridgeCore::MavlinkBridgeCore(
   heartbeat_type_ = static_cast<uint8_t>(get_parameter("heartbeat_type").as_int());
   heartbeat_system_status_ =
     static_cast<uint8_t>(get_parameter("heartbeat_system_status").as_int());
+  ros_queue_depth_ = static_cast<std::size_t>(
+    std::max<int64_t>(10, get_parameter("ros_queue_depth").as_int()));
+  udp_recv_buffer_bytes_ = static_cast<int>(
+    std::max<int64_t>(0, get_parameter("udp_recv_buffer_bytes").as_int()));
+  udp_send_buffer_bytes_ = static_cast<int>(
+    std::max<int64_t>(0, get_parameter("udp_send_buffer_bytes").as_int()));
+  rx_idle_sleep_ms_ = static_cast<int>(
+    std::max<int64_t>(0, get_parameter("rx_idle_sleep_ms").as_int()));
+  enable_tx_stats_ = get_parameter("enable_tx_stats").as_bool();
+  tx_stats_period_sec_ = static_cast<int>(
+    std::max<int64_t>(0, get_parameter("tx_stats_period_sec").as_int()));
 
   // Initial config load creates UDP socket and ROS routes. If it fails, the
   // node should fail fast because running without config would silently drop IO.
@@ -148,6 +166,17 @@ MavlinkBridgeCore::MavlinkBridgeCore(
       this,
       std::placeholders::_1,
       std::placeholders::_2));
+
+  if (enable_tx_stats_ && tx_stats_period_sec_ > 0) {
+    tx_stats_pub_ = create_publisher<std_msgs::msg::String>("~/tx_stats", 10);
+    tx_stats_timer_ = create_wall_timer(
+      std::chrono::seconds(tx_stats_period_sec_),
+      std::bind(&MavlinkBridgeCore::tx_stats_timer_callback, this));
+    RCLCPP_INFO(
+      get_logger(),
+      "MAVLink bridge UDP TX stats enabled: period=%ds topic=~/tx_stats",
+      tx_stats_period_sec_);
+  }
 }
 
 MavlinkBridgeCore::~MavlinkBridgeCore()
@@ -265,6 +294,10 @@ bool MavlinkBridgeCore::reload_config(std::string * message)
         }
       }
     }
+    {
+      std::lock_guard<std::mutex> lock(tx_stats_mutex_);
+      tx_counters_.clear();
+    }
     rebuild_ros_routes(next);
 
     if (std::filesystem::exists(config_file_)) {
@@ -332,6 +365,28 @@ bool MavlinkBridgeCore::open_udp_socket(const BridgeConfig & config, std::string
 
   int reuse = 1;
   (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+  if (udp_recv_buffer_bytes_ > 0 &&
+    ::setsockopt(
+      fd, SOL_SOCKET, SO_RCVBUF,
+      &udp_recv_buffer_bytes_, sizeof(udp_recv_buffer_bytes_)) != 0)
+  {
+    RCLCPP_WARN(
+      get_logger(),
+      "setsockopt SO_RCVBUF=%d failed: %s",
+      udp_recv_buffer_bytes_,
+      std::strerror(errno));
+  }
+  if (udp_send_buffer_bytes_ > 0 &&
+    ::setsockopt(
+      fd, SOL_SOCKET, SO_SNDBUF,
+      &udp_send_buffer_bytes_, sizeof(udp_send_buffer_bytes_)) != 0)
+  {
+    RCLCPP_WARN(
+      get_logger(),
+      "setsockopt SO_SNDBUF=%d failed: %s",
+      udp_send_buffer_bytes_,
+      std::strerror(errno));
+  }
 
   const int flags = ::fcntl(fd, F_GETFL, 0);
   if (flags >= 0) {
@@ -413,7 +468,11 @@ void MavlinkBridgeCore::rx_loop()
           get_logger(), *get_clock(), 2000,
           "MAVLink UDP recvfrom failed: %s", std::strerror(err));
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      if (rx_idle_sleep_ms_ > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(rx_idle_sleep_ms_));
+      } else {
+        std::this_thread::yield();
+      }
       continue;
     }
 
@@ -566,13 +625,17 @@ void MavlinkBridgeCore::heartbeat_timer_callback()
   }
 
   const auto now = std::chrono::steady_clock::now();
-  const auto period = std::chrono::duration<double>(1.0 / config.heartbeat_host_tx_hz);
-  if (last_heartbeat_tx_.time_since_epoch().count() != 0 &&
-    now - last_heartbeat_tx_ < period)
-  {
+  const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+    std::chrono::duration<double>(1.0 / config.heartbeat_host_tx_hz));
+  if (next_heartbeat_tx_.time_since_epoch().count() == 0) {
+    next_heartbeat_tx_ = now;
+  }
+  if (now < next_heartbeat_tx_) {
     return;
   }
-  last_heartbeat_tx_ = now;
+  do {
+    next_heartbeat_tx_ += period;
+  } while (next_heartbeat_tx_ <= now);
 
   mavlink_heartbeat_t heartbeat{};
   heartbeat.timestamp_ms = static_cast<uint32_t>(
@@ -618,6 +681,52 @@ void MavlinkBridgeCore::config_reload_timer_callback()
   }
 }
 
+void MavlinkBridgeCore::tx_stats_timer_callback()
+{
+  if (!enable_tx_stats_) {
+    return;
+  }
+
+  std_msgs::msg::String stats;
+  {
+    std::lock_guard<std::mutex> lock(tx_stats_mutex_);
+    if (tx_counters_.empty()) {
+      return;
+    }
+
+    std::ostringstream oss;
+    oss << "mavlink_bridge_tx_stats";
+    for (auto & item : tx_counters_) {
+      auto & counter = item.second;
+      const auto window_total = counter.window_success + counter.window_failure;
+      const auto total = counter.success + counter.failure;
+      const auto failure_pct = window_total == 0U ? 0.0 :
+        (static_cast<double>(counter.window_failure) * 100.0 /
+        static_cast<double>(window_total));
+
+      oss << " route=" << item.first
+          << " win_ok=" << counter.window_success
+          << " win_fail=" << counter.window_failure
+          << " win_bytes=" << counter.window_bytes
+          << " win_fail_pct=" << std::fixed << std::setprecision(2) << failure_pct
+          << " total_ok=" << counter.success
+          << " total_fail=" << counter.failure
+          << " total=" << total
+          << " bytes=" << counter.bytes;
+
+      counter.window_success = 0;
+      counter.window_failure = 0;
+      counter.window_bytes = 0;
+    }
+    stats.data = oss.str();
+  }
+
+  if (tx_stats_pub_) {
+    tx_stats_pub_->publish(stats);
+  }
+  RCLCPP_INFO(get_logger(), "%s", stats.data.c_str());
+}
+
 void MavlinkBridgeCore::reload_service_callback(
   const std::shared_ptr<ReloadService::Request> /*request*/,
   std::shared_ptr<ReloadService::Response> response)
@@ -660,6 +769,16 @@ bool MavlinkBridgeCore::send_message_to_endpoint(
   uint32_t msgid,
   const mavlink_message_t & msg)
 {
+  if (msg.msgid != msgid) {
+    RCLCPP_WARN(
+      get_logger(),
+      "Refuse sending route MSGID %u to endpoint %s: encoded MAVLink msgid is %u",
+      msgid,
+      endpoint_name.c_str(),
+      msg.msgid);
+    return false;
+  }
+
   std::optional<EndpointConfig> endpoint;
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -693,83 +812,125 @@ bool MavlinkBridgeCore::send_message_to_endpoint_unchecked(
       "Invalid remote_ip for endpoint %s: %s",
       endpoint.name.c_str(),
       endpoint.remote_ip.c_str());
+    record_tx_result(endpoint, msg.msgid, false, 0U);
     return false;
   }
 
   uint8_t buffer[MAVLINK_MAX_PACKET_LEN];
   const uint16_t len = mavlink_msg_to_send_buffer(buffer, &msg);
 
-  std::lock_guard<std::mutex> lock(socket_mutex_);
-  if (socket_fd_ < 0) {
+  ssize_t written = -1;
+  int err = 0;
+  bool socket_ready = true;
+  {
+    std::lock_guard<std::mutex> lock(socket_mutex_);
+    if (socket_fd_ < 0) {
+      socket_ready = false;
+    } else {
+      written = ::sendto(
+        socket_fd_,
+        buffer,
+        len,
+        0,
+        reinterpret_cast<const sockaddr *>(&remote_addr),
+        sizeof(remote_addr));
+      if (written < 0) {
+        err = errno;
+      }
+    }
+  }
+
+  if (!socket_ready) {
+    record_tx_result(endpoint, msg.msgid, false, 0U);
     return false;
   }
 
-  const auto written = ::sendto(
-    socket_fd_,
-    buffer,
-    len,
-    0,
-    reinterpret_cast<const sockaddr *>(&remote_addr),
-    sizeof(remote_addr));
   if (written < 0 || static_cast<uint16_t>(written) != len) {
+    record_tx_result(endpoint, msg.msgid, false, 0U);
     RCLCPP_WARN(
       get_logger(),
       "sendto endpoint %s msgid=%u failed: %s",
       endpoint.name.c_str(),
       msg.msgid,
-      std::strerror(errno));
+      written < 0 ? std::strerror(err) : "short write");
     return false;
   }
+
+  record_tx_result(endpoint, msg.msgid, true, static_cast<uint16_t>(written));
   return true;
+}
+
+void MavlinkBridgeCore::record_tx_result(
+  const EndpointConfig & endpoint,
+  uint32_t msgid,
+  bool success,
+  uint16_t bytes_written)
+{
+  if (!enable_tx_stats_) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(tx_stats_mutex_);
+  auto & counter = tx_counters_[endpoint.name + ":" + std::to_string(msgid)];
+  if (success) {
+    ++counter.success;
+    ++counter.window_success;
+    counter.bytes += bytes_written;
+    counter.window_bytes += bytes_written;
+  } else {
+    ++counter.failure;
+    ++counter.window_failure;
+  }
 }
 
 void MavlinkBridgeCore::create_rx_publisher(const EndpointConfig & endpoint, uint32_t msgid)
 {
   const auto topic = topic_for(endpoint, msgid, true);
   const auto key = publisher_key(endpoint, msgid);
+  const auto qos = rclcpp::QoS(rclcpp::KeepLast(ros_queue_depth_));
 
   rclcpp::PublisherBase::SharedPtr pub;
   // The switch maps the numeric wire protocol to strongly typed ROS messages.
   // Add new MAVLink MSGIDs here and in publish_rx_message().
   switch (msgid) {
     case MAVLINK_MSG_ID_HEARTBEAT:
-      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::HeartbeatStatus>(topic, 10);
+      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::HeartbeatStatus>(topic, qos);
       break;
     case MAVLINK_MSG_ID_IMU_DATA:
-      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::ImuNavStatus>(topic, 10);
+      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::ImuNavStatus>(topic, qos);
       break;
     case MAVLINK_MSG_ID_THRUSTER_STATUS:
-      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::ThrusterStatus>(topic, 10);
+      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::ThrusterStatus>(topic, qos);
       break;
     case MAVLINK_MSG_ID_GS_STATUS:
-      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::GsStatus>(topic, 10);
+      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::GsStatus>(topic, qos);
       break;
     case MAVLINK_MSG_ID_LED_STATUS:
-      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::LedStatus>(topic, 10);
+      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::LedStatus>(topic, qos);
       break;
     case MAVLINK_MSG_ID_VCHECK:
-      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::VcheckStatus>(topic, 10);
+      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::VcheckStatus>(topic, qos);
       break;
     case MAVLINK_MSG_ID_HEIGHT_STATUS:
-      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::SonarAltimeterStatus>(topic, 10);
+      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::SonarAltimeterStatus>(topic, qos);
       break;
     case MAVLINK_MSG_ID_DEPTH_STATUS:
-      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::DepthStatus>(topic, 10);
+      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::DepthStatus>(topic, qos);
       break;
     case MAVLINK_MSG_ID_BEM280:
-      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::Bme280Status>(topic, 10);
+      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::Bme280Status>(topic, qos);
       break;
     case MAVLINK_MSG_ID_SWITCH_STATUS:
-      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::SwitchStatus>(topic, 10);
+      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::SwitchStatus>(topic, qos);
       break;
     case MAVLINK_MSG_ID_DVL_DATA:
-      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::DvlData>(topic, 10);
+      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::DvlData>(topic, qos);
       break;
     case MAVLINK_MSG_ID_MIXED_IO_DATA:
-      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::MixedIoData>(topic, 10);
+      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::MixedIoData>(topic, qos);
       break;
     case MAVLINK_MSG_ID_VALVE_STATUS:
-      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::ValveStatus>(topic, 10);
+      pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::ValveStatus>(topic, qos);
       break;
     default:
       return;
@@ -782,6 +943,7 @@ void MavlinkBridgeCore::create_rx_publisher(const EndpointConfig & endpoint, uin
 void MavlinkBridgeCore::create_tx_subscription(const EndpointConfig & endpoint, uint32_t msgid)
 {
   const auto topic = topic_for(endpoint, msgid, false);
+  const auto qos = rclcpp::QoS(rclcpp::KeepLast(ros_queue_depth_));
   rclcpp::SubscriptionBase::SharedPtr sub;
 
   // Capture endpoint.name instead of the whole EndpointConfig so callbacks use
@@ -789,7 +951,7 @@ void MavlinkBridgeCore::create_tx_subscription(const EndpointConfig & endpoint, 
   switch (msgid) {
     case MAVLINK_MSG_ID_HEARTBEAT:
       sub = create_subscription<sealien_ctrlpilot_msgmanagement::msg::HeartbeatStatus>(
-        topic, 10, [this, endpoint_name = endpoint.name](
+        topic, qos, [this, endpoint_name = endpoint.name](
           sealien_ctrlpilot_msgmanagement::msg::HeartbeatStatus::SharedPtr ros_msg) {
           BridgeConfig current;
           {
@@ -809,7 +971,7 @@ void MavlinkBridgeCore::create_tx_subscription(const EndpointConfig & endpoint, 
       break;
     case MAVLINK_MSG_ID_THRUSTER_CMD:
       sub = create_subscription<sealien_ctrlpilot_msgmanagement::msg::ThrusterCmd>(
-        topic, 10, [this, endpoint_name = endpoint.name](
+        topic, qos, [this, endpoint_name = endpoint.name](
           sealien_ctrlpilot_msgmanagement::msg::ThrusterCmd::SharedPtr ros_msg) {
           BridgeConfig current;
           {
@@ -837,7 +999,7 @@ void MavlinkBridgeCore::create_tx_subscription(const EndpointConfig & endpoint, 
       break;
     case MAVLINK_MSG_ID_THRUSTER_LOCK:
       sub = create_subscription<sealien_ctrlpilot_msgmanagement::msg::ThrusterLock>(
-        topic, 10, [this, endpoint_name = endpoint.name](
+        topic, qos, [this, endpoint_name = endpoint.name](
           sealien_ctrlpilot_msgmanagement::msg::ThrusterLock::SharedPtr ros_msg) {
           BridgeConfig current;
           {
@@ -854,7 +1016,7 @@ void MavlinkBridgeCore::create_tx_subscription(const EndpointConfig & endpoint, 
       break;
     case MAVLINK_MSG_ID_IMU_CALIB:
       sub = create_subscription<sealien_ctrlpilot_msgmanagement::msg::ImuCalib>(
-        topic, 10, [this, endpoint_name = endpoint.name](
+        topic, qos, [this, endpoint_name = endpoint.name](
           sealien_ctrlpilot_msgmanagement::msg::ImuCalib::SharedPtr ros_msg) {
           BridgeConfig current;
           {
@@ -873,7 +1035,7 @@ void MavlinkBridgeCore::create_tx_subscription(const EndpointConfig & endpoint, 
       break;
     case MAVLINK_MSG_ID_IMU_CLEAR:
       sub = create_subscription<sealien_ctrlpilot_msgmanagement::msg::ImuClear>(
-        topic, 10, [this, endpoint_name = endpoint.name](
+        topic, qos, [this, endpoint_name = endpoint.name](
           sealien_ctrlpilot_msgmanagement::msg::ImuClear::SharedPtr ros_msg) {
           BridgeConfig current;
           {
@@ -890,7 +1052,7 @@ void MavlinkBridgeCore::create_tx_subscription(const EndpointConfig & endpoint, 
       break;
     case MAVLINK_MSG_ID_LED_CMD:
       sub = create_subscription<sealien_ctrlpilot_msgmanagement::msg::LedCmd>(
-        topic, 10, [this, endpoint_name = endpoint.name](
+        topic, qos, [this, endpoint_name = endpoint.name](
           sealien_ctrlpilot_msgmanagement::msg::LedCmd::SharedPtr ros_msg) {
           BridgeConfig current;
           {
@@ -908,7 +1070,7 @@ void MavlinkBridgeCore::create_tx_subscription(const EndpointConfig & endpoint, 
       break;
     case MAVLINK_MSG_ID_GS_CMD:
       sub = create_subscription<sealien_ctrlpilot_msgmanagement::msg::GsCmd>(
-        topic, 10, [this, endpoint_name = endpoint.name](
+        topic, qos, [this, endpoint_name = endpoint.name](
           sealien_ctrlpilot_msgmanagement::msg::GsCmd::SharedPtr ros_msg) {
           BridgeConfig current;
           {
@@ -926,7 +1088,7 @@ void MavlinkBridgeCore::create_tx_subscription(const EndpointConfig & endpoint, 
       break;
     case MAVLINK_MSG_ID_GS_CFG:
       sub = create_subscription<sealien_ctrlpilot_msgmanagement::msg::GsCfg>(
-        topic, 10, [this, endpoint_name = endpoint.name](
+        topic, qos, [this, endpoint_name = endpoint.name](
           sealien_ctrlpilot_msgmanagement::msg::GsCfg::SharedPtr ros_msg) {
           BridgeConfig current;
           {
@@ -945,7 +1107,7 @@ void MavlinkBridgeCore::create_tx_subscription(const EndpointConfig & endpoint, 
       break;
     case MAVLINK_MSG_ID_SWITCH_CMD:
       sub = create_subscription<sealien_ctrlpilot_msgmanagement::msg::SwitchCmd>(
-        topic, 10, [this, endpoint_name = endpoint.name](
+        topic, qos, [this, endpoint_name = endpoint.name](
           sealien_ctrlpilot_msgmanagement::msg::SwitchCmd::SharedPtr ros_msg) {
           BridgeConfig current;
           {
@@ -963,7 +1125,7 @@ void MavlinkBridgeCore::create_tx_subscription(const EndpointConfig & endpoint, 
       break;
     case MAVLINK_MSG_ID_MIXED_IO_CMD:
       sub = create_subscription<sealien_ctrlpilot_msgmanagement::msg::MixedIoCmd>(
-        topic, 10, [this, endpoint_name = endpoint.name](
+        topic, qos, [this, endpoint_name = endpoint.name](
           sealien_ctrlpilot_msgmanagement::msg::MixedIoCmd::SharedPtr ros_msg) {
           BridgeConfig current;
           {
@@ -984,7 +1146,7 @@ void MavlinkBridgeCore::create_tx_subscription(const EndpointConfig & endpoint, 
       break;
     case MAVLINK_MSG_ID_VALVE_CMD:
       sub = create_subscription<sealien_ctrlpilot_msgmanagement::msg::ValveCmd>(
-        topic, 10, [this, endpoint_name = endpoint.name](
+        topic, qos, [this, endpoint_name = endpoint.name](
           sealien_ctrlpilot_msgmanagement::msg::ValveCmd::SharedPtr ros_msg) {
           BridgeConfig current;
           {

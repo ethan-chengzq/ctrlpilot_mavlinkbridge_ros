@@ -235,8 +235,10 @@ source install/setup.bash
 ros2 run sealien_ctrlpilot_mavlinkbridge rov_mavlink_test_node --ros-args \
   -p config_file:=/home/se113/SLWS/SealienDCN/src/sealien_ctrlpilot_mavlinkbridge/config/sealien_mavlink_rov.yaml \
   -p target_endpoints:="['nav_sensor_mcu']" \
-  -p tx_period_ms:=1000 \
-  -p quality_report_period_sec:=5 \
+  -p use_stress_rates:=true \
+  -p tx_scheduler_period_ms:=5 \
+  -p brief_report_period_sec:=5 \
+  -p detail_report_period_sec:=60 \
   -p quality_link_timeout_ms:=3000 \
   -p log_quality_report:=true \
   -p safe_mode:=true \
@@ -248,6 +250,9 @@ ros2 run sealien_ctrlpilot_mavlinkbridge rov_mavlink_test_node --ros-args \
 - `rov_mavlink_test_node` 不直接收发 UDP。
 - 它向 `rov/to_mcu/<endpoint>/<message>` 发布测试 ROS 消息，由 `rov_mavlink_node` 转为 MAVLink UDP 下发。
 - 它订阅 `rov/from_mcu/<endpoint>/<message>`，统计并镜像下位机上发消息。
+- `use_stress_rates=true` 时，测试节点按 MSGID 分频发布：心跳 `1 Hz`，`IMU_DATA/DVL_DATA/THRUSTER_CMD` 为 `50 Hz`，其它状态和命令为 `10 Hz`。
+- `brief_report_period_sec=5` 表示每 5 秒输出通信质量简报；`detail_report_period_sec=60` 表示每 1 分钟输出详细报告。
+- `quality_report_period_sec` 为兼容旧参数保留；新测试建议显式设置 `brief_report_period_sec` 和 `detail_report_period_sec`。
 - `include_heartbeat_tx=false` 时，测试节点不额外发布心跳；ROS bridge 自身会按 YAML `tx: [0]` 向 endpoint 定时发送心跳。
 
 测试 102 节点：
@@ -256,7 +261,9 @@ ros2 run sealien_ctrlpilot_mavlinkbridge rov_mavlink_test_node --ros-args \
 ros2 run sealien_ctrlpilot_mavlinkbridge rov_mavlink_test_node --ros-args \
   -p config_file:=/home/se113/SLWS/SealienDCN/src/sealien_ctrlpilot_mavlinkbridge/config/sealien_mavlink_rov.yaml \
   -p target_endpoints:="['actuator_mcu']" \
-  -p tx_period_ms:=1000 \
+  -p use_stress_rates:=true \
+  -p brief_report_period_sec:=5 \
+  -p detail_report_period_sec:=60 \
   -p safe_mode:=true \
   -p include_heartbeat_tx:=false
 ```
@@ -267,7 +274,9 @@ ros2 run sealien_ctrlpilot_mavlinkbridge rov_mavlink_test_node --ros-args \
 ros2 run sealien_ctrlpilot_mavlinkbridge rov_mavlink_test_node --ros-args \
   -p config_file:=/home/se113/SLWS/SealienDCN/src/sealien_ctrlpilot_mavlinkbridge/config/sealien_mavlink_rov.yaml \
   -p target_endpoints:="['io_valve_mcu']" \
-  -p tx_period_ms:=1000 \
+  -p use_stress_rates:=true \
+  -p brief_report_period_sec:=5 \
+  -p detail_report_period_sec:=60 \
   -p safe_mode:=true \
   -p include_heartbeat_tx:=false
 ```
@@ -278,7 +287,9 @@ ros2 run sealien_ctrlpilot_mavlinkbridge rov_mavlink_test_node --ros-args \
 ros2 run sealien_ctrlpilot_mavlinkbridge rov_mavlink_test_node --ros-args \
   -p config_file:=/home/se113/SLWS/SealienDCN/src/sealien_ctrlpilot_mavlinkbridge/config/sealien_mavlink_rov.yaml \
   -p target_endpoints:="['nav_sensor_mcu','actuator_mcu','io_valve_mcu']" \
-  -p tx_period_ms:=1000 \
+  -p use_stress_rates:=true \
+  -p brief_report_period_sec:=5 \
+  -p detail_report_period_sec:=60 \
   -p safe_mode:=true \
   -p include_heartbeat_tx:=false
 ```
@@ -294,7 +305,10 @@ ros2 launch sealien_ctrlpilot_mavlinkbridge rov_mavlink_test.launch.py \
   config_file:=/home/se113/SLWS/SealienDCN/src/sealien_ctrlpilot_mavlinkbridge/config/sealien_mavlink_rov.yaml \
   topic_prefix:=rov \
   target_endpoints:="['nav_sensor_mcu']" \
-  tx_period_ms:=1000 \
+  use_stress_rates:=true \
+  tx_scheduler_period_ms:=5 \
+  brief_report_period_sec:=5 \
+  detail_report_period_sec:=60 \
   safe_mode:=true \
   include_heartbeat_tx:=false
 ```
@@ -309,7 +323,8 @@ source install/setup.bash
 ros2 run sealien_ctrlpilot_mavlinkbridge start_rov_mavlink_test.sh -- \
   --config /home/se113/SLWS/SealienDCN/src/sealien_ctrlpilot_mavlinkbridge/config/sealien_mavlink_rov.yaml \
   --endpoints nav_sensor_mcu \
-  --tx-period-ms 1000
+  --brief-period-sec 5 \
+  --detail-period-sec 60
 ```
 
 安全说明：
@@ -330,6 +345,8 @@ ros2 topic list | grep rov
 
 ```bash
 ros2 topic echo /rov/test/rx_summary
+ros2 topic echo /rov/test/quality_summary
+ros2 topic echo /rov/test/quality_report
 ```
 
 观察下位机上发事件：
@@ -392,15 +409,18 @@ ros2 topic hz /rov/from_mcu/nav_sensor_mcu/imu_data
 | `ROV MAVLink test node loaded X endpoints, Y tx routes and Z rx routes` | 测试节点按 YAML 和 `target_endpoints` 创建了多少测试发布/订阅路由。 |
 | `MAVLink test LINK UP endpoint=... first_rx_msgid=...` | 测试节点第一次从该 endpoint 的 `from_mcu` topic 收到数据。 |
 | `MAVLink test LINK DOWN endpoint=... rx_age_ms=...` | 测试节点超过 `quality_link_timeout_ms` 未收到该 endpoint 数据。 |
-| `/rov/test/tx_events` | 每次测试节点发布下行测试 topic 时产生一条事件。 |
-| `/rov/test/rx_events` | 每次测试节点收到 bridge 发布的上行 topic 时产生一条事件。 |
-| `/rov/test/quality_summary` | 结构化字符串汇总，适合长期 echo 或记录日志。 |
+| `/rov/test/tx_events` | 每次测试节点发布下行测试 topic 时产生一条事件；压力测试默认 `publish_per_message_events=false`，需要逐帧事件时再打开。 |
+| `/rov/test/rx_events` | 每次测试节点收到 bridge 发布的上行 topic 时产生一条事件；压力测试默认 `publish_per_message_events=false`，需要逐帧事件时再打开。 |
+| `/rov/test/quality_summary` | 5 秒通信质量简报，适合长期 echo 或记录日志。 |
+| `/rov/test/quality_report` | 60 秒详细通信质量报告，包含每个 MSGID 的窗口帧数、丢包率、帧间隔和 jitter。 |
+| `/rov/test/rx_summary` | 兼容旧版本的 5 秒简报 topic，内容与 `quality_summary` 同步。 |
 | `/rov/test/from_mcu/<endpoint>/<msg>` | 测试节点镜像的上行数据，便于与正式 `from_mcu` topic 分开观察。 |
 
-`quality_summary` 关键字段：
+`quality_summary`/`quality_report` 关键字段：
 
 | 字段 | 含义 |
 | --- | --- |
+| `LinkStatus online=N/M` | 当前在线 endpoint 数/配置 endpoint 总数；窗口详细块只展开在线 endpoint。 |
 | `window` | 本次统计窗口长度。 |
 | `endpoint` | 当前统计的 endpoint 名称。 |
 | `state=WAIT` | 从启动后还未收到该 endpoint 的任何上行 topic。 |
@@ -409,6 +429,28 @@ ros2 topic hz /rov/from_mcu/nav_sensor_mcu/imu_data
 | `rx_age_ms` | 距离最近一次上行 topic 的时间。 |
 | `tx_ros_to_stm32` | ROS 测试节点已发布的下行消息总数和频率。 |
 | `rx_stm32_to_ros` | ROS 测试节点已收到的上行消息总数和频率。 |
+| `win=A/B` | 当前窗口内实际帧数/期望帧数。 |
+| `missed` | 由目标频率推算的当前窗口缺帧数。 |
+| `loss` | 当前窗口缺帧率。ROS 侧 TX loss 表示测试节点自身调度缺帧，真实 ROS->STM32 到达质量以 STM32 RX 报告为准。 |
+| `local_gap` | 本端相邻帧接收或发布间隔的 avg/min/max。 |
+| `remote_gap` | 对端 `timestamp_ms` 推算的相邻帧间隔；仅对携带时间戳且被解析的消息显示。 |
+| `jitter` | `local_gap` 与 `remote_gap` 的差值统计，用于观察链路/调度抖动。 |
+
+ROS 端 5 秒通信质量简报示例：
+
+```text
+******************************* ROV MAVLink COMM BRIEF (win=5.00s) *******************************
+[LinkStatus] online(2/3): nav_sensor_mcu(192.168.100.101:9999), actuator_mcu(192.168.100.102:9999)
+>>>
+[endpoint] actuator_mcu: peer=192.168.100.102:9999 sysid=102 compid=1 state=UP(OK) window=5.00s rx_age=7ms last_rx_msgid=4 link_up/down=1/0
+EP102 TX ROS->STM32: total=    5958 window=  459/500 rate=  91.80/100.00Hz missed=    41 loss=  8.20%
+      -- THRUSTER_CMD#10      total=     250 win=  250/250 rate=  50.00/ 50.00Hz missed=     0 loss=  0.00%
+EP102 RX STM32->ROS: total=   62570 window=  205/205 rate=  41.00/ 41.00Hz missed=     0 loss=  0.00%
+      -- HEARTBEAT#0          total=    2979 win=      5/5 rate=   1.00/  1.00Hz missed=     0 loss=  0.00%
+         THRUSTER_STATUS#2    total=     500 win=    50/50 rate=  10.00/ 10.00Hz missed=     0 loss=  0.00%
+------------------------------------------------------------------------------------------------------------------------------------
+<<<
+```
 
 ### 8.3 STM32 测试固件日志
 
@@ -417,11 +459,40 @@ ros2 topic hz /rov/from_mcu/nav_sensor_mcu/imu_data
 | `ROV MAVLink test endpoint=... sysid=... compid=... uplink=... downlink=...` | 测试任务启动，显示当前固件身份和消息集合数量。 | 若 endpoint 与预期不一致，重新修改并编译 `ROV_MAVTEST_ACTIVE_ENDPOINT`。 |
 | `MAVLink LINK UP` | STM32 收到 ROS 主机合法下行帧，host 链路置为 UP。 | 若 ROS 已启动但没有该日志，查 ROS 下发 topic、IP 和端口。 |
 | `TX STM32->ROS tx msgid=... period=...Hz` | STM32 注册的周期上发消息及频率。 | 与 YAML `messages.rx` 对照。 |
-| `RX ROS->STM32 rx msgid=...` | STM32 允许接收的下行 MSGID。 | 与 YAML `messages.tx` 对照。 |
-| `MAVLink LINK QUALITY` | STM32 周期输出链路质量统计。 | 看 `Age`、总数和各 MSGID rate 是否持续增长。 |
+| `RX ROS->STM32 rx msgid=... expected=...Hz` | STM32 允许接收的下行 MSGID 及期望频率。 | 与 YAML `messages.tx` 和 ROS 压力频率表对照。 |
+| `ROV MAVLink COMM BRIEF` | STM32 每 5 秒输出一次通信质量简报。 | 看 `window=A/B`、`missed`、`loss` 是否异常。 |
+| `ROV MAVLink COMM DETAIL` | STM32 每 60 秒输出一次详细通信质量报告。 | 看每个 MSGID 的 `window=A/B`、`loss`、`local_gap`、`remote_gap`、`jitter`。 |
 | `heartbeat ts=... type=... status=... ver=...` | 最近一次收到 ROS bridge 心跳的内容。 | 若 heartbeat 计数不增长，查 YAML tx 是否包含 `0`。 |
 | `MAVLink LINK DOWN` | STM32 超过 `ROV_MAVTEST_HOST_TIMEOUT_MS` 未收到 ROS 下行帧。 | 查 ROS bridge 是否仍在运行，或测试节点/bridge 心跳是否关闭。 |
 | `drop msgid=... not allowed for endpoint ...` | STM32 收到 ROS 帧，但该 MSGID 不属于当前 endpoint 的 downlink allowlist。 | 查 ROS target endpoint 和 YAML tx。 |
+
+STM32 端 5 秒通信质量简报示例：
+
+```text
+----------------------------------------------------------------
+ROV MAVLink COMM BRIEF (win=5.00s)
+----------------------------------------------------------------
+[endpoint] actuator_mcu: sysid=102 compid=1 state=UP(OK)
+           window=5.00s rx_age=7ms last_rx=THRUSTER_CMD#10
+           link_up/down=1/0 drops(identity/not_allowed)=0/0
+EP102 TX STM32->ROS:
+  total=   62570 window=  205/205   rate=   41.00/   41.00Hz
+  missed=     0 loss=  0.00%
+      msg               id    total      window      rate/target
+      - HEARTBEAT        #00     2979     5/5        1.00/    1.00Hz
+        missed=     0 loss=  0.00%
+        THRUSTER_STATUS  #02      500    50/50      10.00/   10.00Hz
+        missed=     0 loss=  0.00%
+EP102 RX ROS->STM32:
+  total=    5958 window=  459/500   rate=   91.80/  100.00Hz
+  missed=    41 loss=  8.20%
+      msg               id    total      window      rate/target
+      - HEARTBEAT        #00        0     0/5        0.00/    1.00Hz
+        missed=     5 loss=100.00%
+        THRUSTER_CMD     #10      250   250/250     50.00/   50.00Hz
+        missed=     0 loss=  0.00%
+----------------------------------------------------------------
+```
 
 ## 9. 测试用例
 
@@ -551,7 +622,9 @@ ros2 topic hz /rov/from_mcu/nav_sensor_mcu/heartbeat
 - STM32 端能收到 ROS bridge 下发心跳，串口周期性出现类似日志：
 
 ```text
-rx HEARTBEAT from host status=0
+[ROV MAVLink brief] endpoint=... state=UP ... rx=.../... loss=...
+MAVLink COMM DETAIL
+heartbeat ts=... type=... status=... ver=...
 ```
 
 说明：
