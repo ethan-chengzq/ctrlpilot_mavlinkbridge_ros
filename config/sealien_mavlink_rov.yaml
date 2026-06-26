@@ -1,7 +1,10 @@
-# Sealien MAVLink bridge runtime configuration.
+# Sealien ROV MAVLink bridge 运行配置。
 #
-# MSGID reference (protocol v1.5, worksheet: mavlink).
-# Use numeric MSGIDs in messages.rx/tx.
+# messages.rx/tx 中使用数字 MSGID。方向以 ROS bridge 为视角：
+# - rx: STM32 -> ROS，bridge 接收该 MSGID 并发布到 rov/from_mcu/<endpoint>/<msg>
+# - tx: ROS -> STM32，bridge 订阅 rov/to_mcu/<endpoint>/<msg> 并编码下发
+#
+# MSGID reference (protocol v1.5, worksheet: mavlink):
 # 0 HEARTBEAT, 1 IMU_DATA, 2 THRUSTER_STATUS, 3 GS_STATUS, 4 LED_STATUS
 # 5 VCHECK, 6 HEIGHT_STATUS, 7 DEPTH_STATUS, 8 BEM280, 9 SWITCH_STATUS
 # 10 THRUSTER_CMD, 11 THRUSTER_LOCK, 12 IMU_CALIB, 13 IMU_CLEAR
@@ -12,33 +15,39 @@ sealien_mavlink_bridge:
   dialect: "tools/sealien_mavlink.xml"
 
   host:
+    # ROS 主机自身 MAVLink 身份。STM32 端 downlink 过滤需与此保持一致。
     system_id: 1
     component_id: 1
+    # bind_ip=0.0.0.0 表示监听本机所有网卡；生产环境如需收敛入口，
+    # 可改为指定网口 IP。
     bind_ip: "0.0.0.0"
     bind_port: 9999
 
-  # Timing policy for MSGID 0 HEARTBEAT.
-  # Heartbeat routing is controlled by each endpoint's messages.rx/tx:
-  # - rx contains 0: listen to heartbeat from that endpoint.
-  # - tx contains 0: send heartbeat to that endpoint.
+  # MSGID 0 HEARTBEAT 的时序策略。
+  # 心跳方向仍由各 endpoint 的 messages.rx/tx 控制：
+  # - rx 包含 0：接收该下位机上报心跳。
+  # - tx 包含 0：向该下位机发送 ROS 主机心跳。
   heartbeat:
     host_tx_hz: 1.0
     endpoint_expected_hz: 1.0
     endpoint_timeout_ms: 3000
 
   endpoints:
+    # EP101: 导航/传感器板。system_id/component_id 必须与 STM32 固件一致，
+    # remote_ip/remote_port 必须与板卡网络配置一致。
     - name: "nav_sensor_mcu"
       enabled: true
       system_id: 101
       component_id: 1
       remote_ip: "192.168.100.101"
       remote_port: 9999
-      # A MSGID may appear in both rx and tx when a board supports
-      # bidirectional request/response or mirrored status/control frames.
+      # 同一个 MSGID 可以同时出现在 rx 和 tx 中，用于双向请求/响应或
+      # 状态/控制镜像；一般控制命令只放 tx，状态数据只放 rx。
       messages:
         rx: [0, 1, 5, 6, 7, 8, 18]
         tx: [0, 12, 13]
 
+    # EP102: 推进器/云台/灯光/开关执行板。
     - name: "actuator_mcu"
       enabled: true
       system_id: 102
@@ -49,6 +58,7 @@ sealien_mavlink_bridge:
         rx: [0, 2, 3, 4, 9]
         tx: [0, 10, 11, 14, 15, 16, 17]
 
+    # EP103: 混合 IO/阀控板。
     - name: "io_valve_mcu"
       enabled: true
       system_id: 103

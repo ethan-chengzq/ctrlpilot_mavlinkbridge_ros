@@ -86,9 +86,9 @@ install(DIRECTORY launch/
   PATTERN "__pycache__" EXCLUDE
 )
 
-# install(DIRECTORY docs/
-#   DESTINATION share/${PROJECT_NAME}/docs
-# )
+install(DIRECTORY docs/
+  DESTINATION share/${PROJECT_NAME}/docs
+)
 
 install(DIRECTORY lib/
   DESTINATION share/${PROJECT_NAME}/lib

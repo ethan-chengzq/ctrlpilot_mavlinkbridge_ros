@@ -24,6 +24,13 @@ def _as_int(name: str, value: str) -> int:
         raise RuntimeError(f"launch argument {name} must be an integer: {value}") from exc
 
 
+def _as_float(name: str, value: str) -> float:
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise RuntimeError(f"launch argument {name} must be a number: {value}") from exc
+
+
 def _parse_target_endpoints(value: str) -> list[str]:
     text = value.strip()
     if not text or text == "[]":
@@ -80,6 +87,10 @@ def _launch_setup(context, *_, **__):
             "tx_stats_period_sec",
             LaunchConfiguration("tx_stats_period_sec").perform(context),
         ),
+        "heartbeat_host_tx_hz_override": _as_float(
+            "bridge_heartbeat_host_tx_hz",
+            LaunchConfiguration("bridge_heartbeat_host_tx_hz").perform(context),
+        ),
     }
 
     test_params = {
@@ -120,6 +131,10 @@ def _launch_setup(context, *_, **__):
             LaunchConfiguration("publish_rx_mirror_topics").perform(context)
         ),
         "safe_mode": _as_bool(LaunchConfiguration("safe_mode").perform(context)),
+        "subscribe_bridge_tx_stats": _as_bool(
+            LaunchConfiguration("subscribe_bridge_tx_stats").perform(context)
+        ),
+        "bridge_tx_stats_topic": LaunchConfiguration("bridge_tx_stats_topic").perform(context),
     }
     # launch_ros cannot normalize an empty array parameter reliably across ROS 2
     # distributions. Omit it when empty so the C++ node keeps its declared default.
@@ -213,8 +228,8 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "include_heartbeat_tx",
-                default_value="false",
-                description="Whether the test node also publishes HEARTBEAT topic messages.",
+                default_value="true",
+                description="Whether the test node publishes and counts HEARTBEAT topic messages.",
             ),
             DeclareLaunchArgument(
                 "log_quality_report",
@@ -230,6 +245,16 @@ def generate_launch_description():
                 "publish_rx_mirror_topics",
                 default_value="false",
                 description="Whether the test node republishes RX messages to rov/test/from_mcu/* topics.",
+            ),
+            DeclareLaunchArgument(
+                "subscribe_bridge_tx_stats",
+                default_value="true",
+                description="Whether the test node subscribes to bridge UDP sendto statistics.",
+            ),
+            DeclareLaunchArgument(
+                "bridge_tx_stats_topic",
+                default_value="/rov_mavlink_node/tx_stats",
+                description="Topic published by rov_mavlink_node for actual UDP sendto statistics.",
             ),
             DeclareLaunchArgument(
                 "ros_queue_depth",
@@ -260,6 +285,14 @@ def generate_launch_description():
                 "tx_stats_period_sec",
                 default_value="60",
                 description="Bridge actual UDP TX stats report period in seconds; 0 disables timer.",
+            ),
+            DeclareLaunchArgument(
+                "bridge_heartbeat_host_tx_hz",
+                default_value="0.0",
+                description=(
+                    "Override bridge-owned heartbeat rate. Use 0.0 in stress tests "
+                    "so the test node owns HEARTBEAT timing/statistics; use -1.0 to keep YAML."
+                ),
             ),
             DeclareLaunchArgument(
                 "safe_mode",

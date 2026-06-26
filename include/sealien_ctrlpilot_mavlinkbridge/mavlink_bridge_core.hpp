@@ -50,9 +50,14 @@ extern "C" {
 namespace sealien_ctrlpilot_mavlinkbridge
 {
 
-// One STM32 lower-controller reachable from the ROS host.
-// rx/tx are intentionally split so the bridge can enforce per-endpoint routing
-// instead of broadcasting every MAVLink frame to every board.
+// 单块 STM32 下位机的静态配置。
+//
+// 这里的 rx/tx 是站在 ROS bridge 视角定义的：
+// - rx: ROS 从该 endpoint 接收的 MAVLink MSGID，bridge 会发布到 rov/from_mcu/*
+// - tx: ROS 允许发往该 endpoint 的 MAVLink MSGID，bridge 会订阅 rov/to_mcu/*
+//
+// rx/tx 分开配置是为了让 bridge 做“按板卡、按消息”的白名单路由，避免把所有
+// MAVLink 帧广播给所有 STM32。
 struct EndpointConfig
 {
   std::string name;
@@ -65,9 +70,10 @@ struct EndpointConfig
   std::set<uint32_t> tx;
 };
 
-// Runtime view of config/sealien_mavlink_*.yaml.
-// The YAML file remains the single source of truth for endpoint identity,
-// UDP address and allowed MSGID directions.
+// YAML 配置在运行期的内存视图。
+//
+// config/sealien_mavlink_*.yaml 是 endpoint 身份、UDP 地址和消息方向白名单
+// 的唯一配置源。业务节点不应在代码里硬编码下位机 IP 或 MSGID 路由。
 struct BridgeConfig
 {
   std::string dialect;
@@ -81,13 +87,14 @@ struct BridgeConfig
   std::vector<EndpointConfig> endpoints;
 };
 
-// Shared implementation used by both ROV and TMS executable nodes.
+// MAVLink bridge 的共享实现。
 //
-// Data flow:
-//   STM32 UDP MAVLink -> rx_loop() -> route validation -> ROS topic publish
-//   ROS topic subscribe -> MAVLink encode -> tx route validation -> STM32 UDP
+// 数据流：
+//   STM32 UDP MAVLink -> rx_loop() -> 身份/MSGID 校验 -> ROS topic 发布
+//   ROS topic 订阅 -> MAVLink encode -> tx 白名单校验 -> UDP sendto STM32
 //
-// The two concrete nodes only choose a default YAML file and topic prefix.
+// 具体可执行节点只负责选择默认 YAML 和 topic_prefix。新增产品线时优先复用
+// MavlinkBridgeCore，不建议复制一份 bridge 逻辑再改。
 class MavlinkBridgeCore : public rclcpp::Node
 {
 public:
@@ -161,8 +168,8 @@ private:
 
   void publish_rx_message(const EndpointConfig & endpoint, const mavlink_message_t & msg);
 
-  // Publishers are stored as PublisherBase because their concrete message type
-  // depends on MSGID. The template recovers the concrete type at publish time.
+  // 不同 MSGID 对应不同 ROS message 类型，因此 publisher 只能统一保存为
+  // PublisherBase；真正 publish 前再 dynamic_cast 回具体类型。
   template<typename MessageT>
   void publish_typed(const std::string & key, const MessageT & message)
   {
@@ -197,6 +204,7 @@ private:
   bool strict_remote_ip_{false};
   uint8_t heartbeat_type_{1};
   uint8_t heartbeat_system_status_{0};
+  double heartbeat_host_tx_hz_override_{-1.0};
   std::size_t ros_queue_depth_{100};
   int udp_recv_buffer_bytes_{262144};
   int udp_send_buffer_bytes_{262144};
@@ -204,8 +212,8 @@ private:
   bool enable_tx_stats_{true};
   int tx_stats_period_sec_{60};
 
-  // Protects configuration and ROS communication handles while config reload
-  // can rebuild routes concurrently with receive callbacks.
+  // 保护配置和 ROS 路由句柄。自动重载 YAML 时会重建 publisher/subscription，
+  // 同时 rx_thread 和 ROS 回调仍可能读配置，因此必须统一走这把锁。
   mutable std::mutex state_mutex_;
   BridgeConfig config_;
   std::unordered_map<std::string, rclcpp::PublisherBase::SharedPtr> publishers_;
@@ -214,15 +222,15 @@ private:
   mutable std::mutex endpoint_state_mutex_;
   std::unordered_map<std::string, EndpointRuntimeState> endpoint_states_;
 
-  // Protects the POSIX UDP socket shared by receive thread, send callbacks and
-  // config reload. Keep this separate from state_mutex_ to avoid long lock chains.
+  // 保护 POSIX UDP socket。socket 同时被接收线程、发送回调和配置重载使用。
+  // 这把锁独立于 state_mutex_，避免 socket IO 与配置锁形成过长锁链。
   mutable std::mutex socket_mutex_;
   int socket_fd_{-1};
 
   mutable std::mutex tx_stats_mutex_;
   std::unordered_map<std::string, TxCounter> tx_counters_;
 
-  // MAVLink parser state is used only by rx_thread_.
+  // MAVLink C parser 状态只在 rx_thread_ 中使用，不跨线程共享。
   std::atomic<bool> running_{false};
   std::thread rx_thread_;
   mavlink_status_t rx_status_{};

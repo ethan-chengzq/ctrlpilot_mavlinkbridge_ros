@@ -21,8 +21,8 @@ namespace sealien_ctrlpilot_mavlinkbridge
 namespace
 {
 
-// Generated MAVLink C structs and ROS 2 fixed-size arrays use different types,
-// but both expose size()/operator[]. These helpers keep field mapping readable.
+// MAVLink 生成的 C 数组和 ROS 2 固定数组类型不同，但都支持 size()/operator[]。
+// 统一用这两个 helper 做数组字段拷贝，避免在每个 MSGID 映射里重复手写循环。
 template<typename RosArrayT, typename MavArrayT>
 void copy_to_ros_array(RosArrayT & dst, const MavArrayT & src)
 {
@@ -39,8 +39,8 @@ void copy_to_mav_array(MavArrayT & dst, const RosArrayT & src)
   }
 }
 
-// YAML is human-maintained; validate integer ranges before narrowing to the
-// uint8_t/uint16_t types used by the MAVLink header.
+// YAML 由人工维护，读取后先校验范围，再收窄到 MAVLink header 使用的
+// uint8_t/uint16_t，避免非法配置在运行期静默截断。
 uint8_t read_u8(const YAML::Node & node, const std::string & key)
 {
   const auto value = node[key].as<int>();
@@ -84,8 +84,8 @@ std::string ip_to_string(const sockaddr_in & addr)
   return std::string(buf);
 }
 
-// ROS topic names are assembled from a prefix. Accept both "rov" and "/rov"
-// from parameters, but store one normalized form internally.
+// topic_prefix 允许用户传 "rov" 或 "/rov"，内部统一去掉首尾斜杠。
+// 这样 topic 拼接逻辑只需要维护一种格式。
 std::string trim_slashes(std::string value)
 {
   while (!value.empty() && value.front() == '/') {
@@ -113,6 +113,7 @@ MavlinkBridgeCore::MavlinkBridgeCore(
   declare_parameter<bool>("strict_remote_ip", false);
   declare_parameter<int>("heartbeat_type", 1);
   declare_parameter<int>("heartbeat_system_status", 0);
+  declare_parameter<double>("heartbeat_host_tx_hz_override", -1.0);
   declare_parameter<int>("ros_queue_depth", 100);
   declare_parameter<int>("udp_recv_buffer_bytes", 262144);
   declare_parameter<int>("udp_send_buffer_bytes", 262144);
@@ -127,6 +128,7 @@ MavlinkBridgeCore::MavlinkBridgeCore(
   heartbeat_type_ = static_cast<uint8_t>(get_parameter("heartbeat_type").as_int());
   heartbeat_system_status_ =
     static_cast<uint8_t>(get_parameter("heartbeat_system_status").as_int());
+  heartbeat_host_tx_hz_override_ = get_parameter("heartbeat_host_tx_hz_override").as_double();
   ros_queue_depth_ = static_cast<std::size_t>(
     std::max<int64_t>(10, get_parameter("ros_queue_depth").as_int()));
   udp_recv_buffer_bytes_ = static_cast<int>(
@@ -139,8 +141,8 @@ MavlinkBridgeCore::MavlinkBridgeCore(
   tx_stats_period_sec_ = static_cast<int>(
     std::max<int64_t>(0, get_parameter("tx_stats_period_sec").as_int()));
 
-  // Initial config load creates UDP socket and ROS routes. If it fails, the
-  // node should fail fast because running without config would silently drop IO.
+  // 首次加载配置会创建 UDP socket 和 ROS 路由。若失败直接抛错退出，
+  // 不允许节点在“没有有效路由”的状态下继续运行并静默丢数据。
   std::string error;
   if (!reload_config(&error)) {
     throw std::runtime_error("failed to load MAVLink bridge config: " + error);
@@ -239,8 +241,8 @@ BridgeConfig MavlinkBridgeCore::load_config_file(const std::string & path) const
     endpoint.rx = read_msgids(messages["rx"]);
     endpoint.tx = read_msgids(messages["tx"]);
 
-    // Duplicate names break topic naming; duplicate MAVLink identities break
-    // inbound routing. Catch both at load time instead of during operation.
+    // endpoint.name 参与 ROS topic 命名，system_id/component_id 参与入站 MAVLink
+    // 身份匹配；两者都必须唯一，否则运行期无法可靠路由。
     if (!endpoint_names.insert(endpoint.name).second) {
       throw std::runtime_error("duplicate endpoint name: " + endpoint.name);
     }
@@ -267,9 +269,12 @@ bool MavlinkBridgeCore::reload_config(std::string * message)
 {
   try {
     auto next = load_config_file(config_file_);
+    if (heartbeat_host_tx_hz_override_ >= 0.0) {
+      next.heartbeat_host_tx_hz = heartbeat_host_tx_hz_override_;
+    }
     std::string error;
-    // Open/bind the new socket before replacing config state. If binding fails,
-    // the old runtime remains untouched and the caller gets an error message.
+    // 先用新配置创建并 bind 新 socket，成功后才替换运行期配置。
+    // 这样 YAML 自动重载遇到错误时不会破坏当前正在工作的通信链路。
     if (!open_udp_socket(next, &error)) {
       if (message) {
         *message = error;
@@ -280,8 +285,9 @@ bool MavlinkBridgeCore::reload_config(std::string * message)
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       config_ = next;
-      // Dropping these shared_ptr handles unregisters old ROS routes. New
-      // publishers/subscribers are rebuilt from the freshly loaded YAML below.
+      next_heartbeat_tx_ = {};
+      // 清空 shared_ptr 会注销旧 ROS 路由，随后按新 YAML 重建。
+      // 注意：业务节点应通过 topic 名称感知路由变化，不应持有内部句柄。
       publishers_.clear();
       subscriptions_.clear();
     }
@@ -309,9 +315,10 @@ bool MavlinkBridgeCore::reload_config(std::string * message)
     }
     RCLCPP_INFO(
       get_logger(),
-      "Loaded MAVLink config %s with %zu endpoints",
+      "Loaded MAVLink config %s with %zu endpoints heartbeat_host_tx_hz=%.2f",
       config_file_.c_str(),
-      next.endpoints.size());
+      next.endpoints.size(),
+      next.heartbeat_host_tx_hz);
     for (const auto & endpoint : next.endpoints) {
       RCLCPP_INFO(
         get_logger(),
@@ -336,8 +343,8 @@ bool MavlinkBridgeCore::reload_config(std::string * message)
 
 void MavlinkBridgeCore::rebuild_ros_routes(const BridgeConfig & config)
 {
-  // Routes are generated strictly from endpoint messages.rx/tx. This is where
-  // the YAML config becomes the ROS API exposed by the node.
+  // ROS API 完全由 YAML endpoint.messages.rx/tx 生成。
+  // 增减 endpoint 或 MSGID 时，优先改 YAML；只有新增协议字段时才需要改 C++ 映射。
   for (const auto & endpoint : config.endpoints) {
     if (!endpoint.enabled) {
       continue;
@@ -353,8 +360,8 @@ void MavlinkBridgeCore::rebuild_ros_routes(const BridgeConfig & config)
 
 bool MavlinkBridgeCore::open_udp_socket(const BridgeConfig & config, std::string * error)
 {
-  // Build a new fd first. The shared socket_fd_ is swapped only after bind()
-  // succeeds, which makes automatic reload non-disruptive on invalid configs.
+  // 先创建临时 fd，bind 成功后再替换共享 socket_fd_。
+  // 这是为了保证配置热重载失败时旧 socket 仍然可用。
   const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0) {
     if (error) {
@@ -441,9 +448,8 @@ void MavlinkBridgeCore::rx_loop()
 {
   uint8_t buffer[2048];
 
-  // recvfrom() runs in a dedicated thread because POSIX socket IO is outside
-  // the ROS executor. The socket is non-blocking so shutdown/reload can proceed
-  // without waiting on a blocking read.
+  // POSIX UDP 收包不放在 ROS executor 中执行，而是由独立线程负责。
+  // socket 设置为非阻塞，便于节点退出和配置重载时快速释放。
   while (rclcpp::ok() && running_) {
     sockaddr_in src_addr{};
     socklen_t src_len = sizeof(src_addr);
@@ -477,8 +483,8 @@ void MavlinkBridgeCore::rx_loop()
     }
 
     for (ssize_t i = 0; i < nbytes; ++i) {
-      // MAVLink frames are parsed byte-by-byte. One UDP datagram may contain
-      // partial, one, or multiple frames; mavlink_parse_char() handles framing.
+      // MAVLink 按字节流解析。一个 UDP datagram 可能包含半帧、一帧或多帧，
+      // 统一交给 mavlink_parse_char() 做帧同步和 CRC 校验。
       if (mavlink_parse_char(MAVLINK_COMM_0, buffer[i], &rx_msg_, &rx_status_)) {
         handle_mavlink_message(rx_msg_, src_addr);
       }
@@ -575,8 +581,10 @@ void MavlinkBridgeCore::handle_mavlink_message(
     endpoint = find_incoming_endpoint_locked(msg);
   }
 
-  // The bridge is intentionally not a broadcast receiver. Both MAVLink identity
-  // and configured rx MSGID must match before data is allowed into ROS.
+  // bridge 不是“谁发都收”的广播接收器。入站帧必须同时满足：
+  // 1. system_id/component_id 匹配某个 enabled endpoint；
+  // 2. MSGID 位于该 endpoint 的 rx 白名单。
+  // 只有通过校验的数据才会进入 ROS topic。
   if (!endpoint) {
     RCLCPP_DEBUG(
       get_logger(),
@@ -645,8 +653,10 @@ void MavlinkBridgeCore::heartbeat_timer_callback()
   heartbeat.mavlink_version = 2;
 
   for (const auto & endpoint : config.endpoints) {
-    // Heartbeat is treated like any other route: only endpoints with tx: [0]
-    // receive host heartbeats. Listening is controlled by rx: [0].
+    // HEARTBEAT 也按普通路由处理：
+    // - endpoint.tx 包含 0，bridge 才会向该板发送主机心跳；
+    // - endpoint.rx 包含 0，bridge 才会接收该板上报心跳。
+    // 这样可以针对不同板卡独立开关心跳方向。
     if (!endpoint.enabled || endpoint.tx.count(MAVLINK_MSG_ID_HEARTBEAT) == 0U) {
       continue;
     }
@@ -673,8 +683,8 @@ void MavlinkBridgeCore::config_reload_timer_callback()
     return;
   }
 
-  // File mtime based reload keeps field tuning lightweight during bring-up; the
-  // explicit service below is still available for deterministic reload points.
+  // 通过文件 mtime 做自动重载，便于联调时快速调整 YAML。
+  // 若生产场景需要确定性重载点，可关闭 auto_reload 并调用 ~/reload_config 服务。
   std::string message;
   if (!reload_config(&message)) {
     RCLCPP_ERROR(get_logger(), "Failed to auto-reload MAVLink config: %s", message.c_str());
@@ -794,8 +804,8 @@ bool MavlinkBridgeCore::send_message_to_endpoint(
     return false;
   }
 
-  // All normal ROS->MAVLink sends pass this gate. send_message_to_endpoint_unchecked()
-  // is reserved for already-vetted internal sends such as heartbeat.
+  // 所有普通 ROS->MAVLink 下发都必须经过这个白名单入口。
+  // send_message_to_endpoint_unchecked() 只给内部已校验流程使用，例如 heartbeat。
   return send_message_to_endpoint_unchecked(*endpoint, msg);
 }
 
@@ -890,8 +900,12 @@ void MavlinkBridgeCore::create_rx_publisher(const EndpointConfig & endpoint, uin
   const auto qos = rclcpp::QoS(rclcpp::KeepLast(ros_queue_depth_));
 
   rclcpp::PublisherBase::SharedPtr pub;
-  // The switch maps the numeric wire protocol to strongly typed ROS messages.
-  // Add new MAVLink MSGIDs here and in publish_rx_message().
+  // 将线上的 MAVLink MSGID 映射为强类型 ROS publisher。
+  // 新增上行 MSGID 时，需要同步修改：
+  // 1. is_supported_msgid()
+  // 2. msgid_name()/msgid_topic_name()
+  // 3. create_rx_publisher()
+  // 4. publish_rx_message()
   switch (msgid) {
     case MAVLINK_MSG_ID_HEARTBEAT:
       pub = create_publisher<sealien_ctrlpilot_msgmanagement::msg::HeartbeatStatus>(topic, qos);
@@ -946,8 +960,8 @@ void MavlinkBridgeCore::create_tx_subscription(const EndpointConfig & endpoint, 
   const auto qos = rclcpp::QoS(rclcpp::KeepLast(ros_queue_depth_));
   rclcpp::SubscriptionBase::SharedPtr sub;
 
-  // Capture endpoint.name instead of the whole EndpointConfig so callbacks use
-  // the latest tx route/address after a config reload.
+  // 回调只捕获 endpoint.name，不捕获完整 EndpointConfig。
+  // 这样 YAML 热重载修改 IP/端口/tx 白名单后，回调会在发送前重新查最新配置。
   switch (msgid) {
     case MAVLINK_MSG_ID_HEARTBEAT:
       sub = create_subscription<sealien_ctrlpilot_msgmanagement::msg::HeartbeatStatus>(
@@ -1180,8 +1194,8 @@ void MavlinkBridgeCore::publish_rx_message(
 {
   const auto key = publisher_key(endpoint, msg.msgid);
 
-  // Decode the MAVLink payload only after routing validation. Field assignments
-  // are intentionally explicit so workbook/XML/ROS names can diverge safely.
+  // 只有通过身份和 rx 白名单校验后才解码 payload。
+  // 字段赋值保持显式展开，允许 MAVLink XML、工作表和 ROS msg 字段名不完全一致。
   switch (msg.msgid) {
     case MAVLINK_MSG_ID_HEARTBEAT: {
       mavlink_heartbeat_t mav{};

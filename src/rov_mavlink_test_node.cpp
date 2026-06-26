@@ -65,6 +65,17 @@ constexpr const char * kLogYellow = "";
 constexpr const char * kLogMagenta = "";
 #endif
 
+// 本文件仅用于 MAVLink 通信质量压测，不承担生产控制职责。
+//
+// 统计口径说明：
+// - TX TestNode->BridgeTopic: 测试节点按计划 publish 到 rov/to_mcu/*；
+//   它衡量测试激励调度，不等于 UDP 已发送或 STM32 已收到。
+// - Bridge UDP sendto: 从 rov_mavlink_node/tx_stats 订阅到的真实 sendto 结果；
+//   用来判断 bridge 到 UDP socket 这一层是否失败。
+// - RX BridgeTopic->TestNode: bridge 已收到 STM32 MAVLink 并发布到 rov/from_mcu/*；
+//   这是 ROS 侧观察 STM32 上行到达质量的主要依据。
+//
+// 生产环境不要与正式控制节点混跑该节点，除非测试话题和硬件动作已隔离。
 struct TestEndpoint
 {
   std::string name;
@@ -80,7 +91,11 @@ struct TestEndpoint
 struct EndpointQuality
 {
   bool linked{false};
+  bool brief_baseline_initialized{false};
+  bool detail_baseline_initialized{false};
   std::chrono::steady_clock::time_point last_rx{};
+  std::chrono::steady_clock::time_point brief_window_start{};
+  std::chrono::steady_clock::time_point detail_window_start{};
   uint64_t link_up_count{0};
   uint64_t link_down_count{0};
   uint32_t last_rx_msgid{0};
@@ -133,6 +148,18 @@ struct RateSummary
   double loss_pct{0.0};
   std::string messages{"none"};
   std::vector<MessageRateSummary> message_details;
+};
+
+struct BridgeTxRouteStats
+{
+  uint64_t win_ok{0};
+  uint64_t win_fail{0};
+  uint64_t win_bytes{0};
+  double win_fail_pct{0.0};
+  uint64_t total_ok{0};
+  uint64_t total_fail{0};
+  uint64_t total{0};
+  uint64_t bytes{0};
 };
 
 std::set<uint32_t> read_msgids(const YAML::Node & node)
@@ -227,7 +254,7 @@ uint64_t expected_frames(double rate_hz, double elapsed_sec)
   if (rate_hz <= 0.0 || elapsed_sec <= 0.0) {
     return 0;
   }
-  return static_cast<uint64_t>(std::llround(rate_hz * elapsed_sec));
+  return static_cast<uint64_t>(std::floor((rate_hz * elapsed_sec) + 1.0e-9));
 }
 
 void add_gap_sample(GapStats & stats, double value_ms)
@@ -281,6 +308,8 @@ public:
     declare_parameter<bool>("publish_per_message_events", false);
     declare_parameter<bool>("publish_rx_mirror_topics", false);
     declare_parameter<bool>("safe_mode", true);
+    declare_parameter<bool>("subscribe_bridge_tx_stats", true);
+    declare_parameter<std::string>("bridge_tx_stats_topic", "/rov_mavlink_node/tx_stats");
 
     config_file_ = get_parameter("config_file").as_string();
     topic_prefix_ = trim_slashes(get_parameter("topic_prefix").as_string());
@@ -290,6 +319,8 @@ public:
     log_quality_report_ = get_parameter("log_quality_report").as_bool();
     publish_per_message_events_ = get_parameter("publish_per_message_events").as_bool();
     publish_rx_mirror_topics_ = get_parameter("publish_rx_mirror_topics").as_bool();
+    subscribe_bridge_tx_stats_ = get_parameter("subscribe_bridge_tx_stats").as_bool();
+    bridge_tx_stats_topic_ = get_parameter("bridge_tx_stats_topic").as_string();
     tx_route_stagger_ms_ =
       static_cast<uint32_t>(std::max<int64_t>(0, get_parameter("tx_route_stagger_ms").as_int()));
     quality_link_timeout_ms_ =
@@ -301,6 +332,12 @@ public:
     quality_summary_pub_ = create_publisher<std_msgs::msg::String>(test_topic("quality_summary"), 10);
     quality_report_pub_ = create_publisher<std_msgs::msg::String>(test_topic("quality_report"), 10);
     legacy_rx_summary_pub_ = create_publisher<std_msgs::msg::String>(test_topic("rx_summary"), 10);
+    if (subscribe_bridge_tx_stats_) {
+      bridge_tx_stats_sub_ = create_subscription<std_msgs::msg::String>(
+        bridge_tx_stats_topic_,
+        10,
+        std::bind(&RovMavlinkTestNode::bridge_tx_stats_callback, this, std::placeholders::_1));
+    }
 
     const auto endpoints = load_endpoints(config_file_);
     build_routes(endpoints);
@@ -322,8 +359,6 @@ public:
     detail_timer_ = create_wall_timer(
       std::chrono::seconds(detail_report_period_sec),
       std::bind(&RovMavlinkTestNode::detail_timer_callback, this));
-    last_brief_time_ = std::chrono::steady_clock::now();
-    last_detail_time_ = last_brief_time_;
 
     RCLCPP_INFO(
       get_logger(),
@@ -353,7 +388,17 @@ public:
       test_topic("rx_summary").c_str());
     RCLCPP_INFO(
       get_logger(),
-      "Run this node together with rov_mavlink_node; this test node observes ROS topics and does not open a MAVLink UDP socket itself");
+      "Run this node together with rov_mavlink_node; this test node observes/publishes ROS topics and does not open a MAVLink UDP socket itself");
+    if (subscribe_bridge_tx_stats_) {
+      RCLCPP_INFO(
+        get_logger(),
+        "Bridge UDP sendto statistics subscribed from %s; test TX counters still mean ROS topic publish attempts",
+        bridge_tx_stats_topic_.c_str());
+    } else {
+      RCLCPP_WARN(
+        get_logger(),
+        "subscribe_bridge_tx_stats=false: test TX counters only show ROS topic publish attempts, not UDP sendto success");
+    }
     if (!include_heartbeat_tx_) {
       RCLCPP_INFO(
         get_logger(),
@@ -374,6 +419,9 @@ public:
         get_logger(),
         "safe_mode=true: command test payloads use non-actuating or low-risk values");
     }
+    RCLCPP_WARN(
+      get_logger(),
+      "This executable is a stress-test publisher; do not run it with production control nodes unless the test topic routes are intentionally isolated");
   }
 
 private:
@@ -444,7 +492,16 @@ private:
       selected_endpoints_.push_back(endpoint);
       endpoint_quality_.emplace(endpoint.name, EndpointQuality{});
 
-      for (const auto msgid : endpoint.tx) {
+      std::vector<uint32_t> tx_msgids(endpoint.tx.begin(), endpoint.tx.end());
+      std::sort(tx_msgids.begin(), tx_msgids.end(), [](uint32_t lhs, uint32_t rhs) {
+        const auto lhs_rate = stress_rate_hz(lhs);
+        const auto rhs_rate = stress_rate_hz(rhs);
+        if (lhs_rate != rhs_rate) {
+          return lhs_rate > rhs_rate;
+        }
+        return lhs < rhs;
+      });
+      for (const auto msgid : tx_msgids) {
         if (msgid == 0U && !include_heartbeat_tx_) {
           continue;
         }
@@ -457,7 +514,7 @@ private:
 
       RCLCPP_INFO(
         get_logger(),
-        "Test endpoint=%s peer=%s:%u sysid=%u compid=%u routes TX ROS->STM32=%s RX STM32->ROS=%s",
+        "Test endpoint=%s peer=%s:%u sysid=%u compid=%u routes TX TestNode->BridgeTopic=%s RX BridgeTopic->TestNode=%s",
         endpoint.name.c_str(),
         endpoint.remote_ip.c_str(),
         endpoint.remote_port,
@@ -684,26 +741,53 @@ private:
     }
   }
 
-  void reset_stream_windows_locked(
+  void reset_endpoint_stream_windows_locked(
+    const TestEndpoint & endpoint,
     std::unordered_map<std::string, StreamQuality> & tx_streams,
     std::unordered_map<std::string, StreamQuality> & rx_streams)
   {
-    auto reset_one = [](auto & streams) {
-      for (auto & item : streams) {
-        item.second.window_count = 0;
-        item.second.have_local = false;
-        item.second.last_local_ms = 0;
-        item.second.have_remote = false;
-        item.second.last_remote_ms = 0;
-        item.second.local_gap = GapStats{};
-        item.second.remote_gap = GapStats{};
-        item.second.jitter = GapStats{};
-        item.second.remote_out_of_order_window = 0;
-      }
+    auto reset_msg = [](auto & streams, const std::string & key) {
+      auto & stream = streams[key];
+      stream.window_count = 0;
+      stream.have_local = false;
+      stream.last_local_ms = 0;
+      stream.have_remote = false;
+      stream.last_remote_ms = 0;
+      stream.local_gap = GapStats{};
+      stream.remote_gap = GapStats{};
+      stream.jitter = GapStats{};
+      stream.remote_out_of_order_window = 0;
     };
 
-    reset_one(tx_streams);
-    reset_one(rx_streams);
+    for (const auto msgid : endpoint.tx) {
+      if (msgid == 0U && !include_heartbeat_tx_) {
+        continue;
+      }
+      reset_msg(tx_streams, stats_key(endpoint.name, msgid));
+    }
+    for (const auto msgid : endpoint.rx) {
+      reset_msg(rx_streams, stats_key(endpoint.name, msgid));
+    }
+  }
+
+  void snapshot_endpoint_counts_locked(
+    const TestEndpoint & endpoint,
+    std::unordered_map<std::string, uint64_t> & tx_snapshot,
+    std::unordered_map<std::string, uint64_t> & rx_snapshot) const
+  {
+    for (const auto msgid : endpoint.tx) {
+      if (msgid == 0U && !include_heartbeat_tx_) {
+        continue;
+      }
+      const auto key = stats_key(endpoint.name, msgid);
+      const auto it = tx_counts_.find(key);
+      tx_snapshot[key] = (it == tx_counts_.end()) ? 0ULL : it->second;
+    }
+    for (const auto msgid : endpoint.rx) {
+      const auto key = stats_key(endpoint.name, msgid);
+      const auto it = rx_counts_.find(key);
+      rx_snapshot[key] = (it == rx_counts_.end()) ? 0ULL : it->second;
+    }
   }
 
   void publish_event(
@@ -726,6 +810,94 @@ private:
         << " topic=" << topic;
     event.data = oss.str();
     pub->publish(event);
+  }
+
+  static bool parse_u64_token(const std::string & token, const std::string & key, uint64_t & value)
+  {
+    const auto prefix = key + "=";
+    if (token.rfind(prefix, 0) != 0U) {
+      return false;
+    }
+    try {
+      value = static_cast<uint64_t>(std::stoull(token.substr(prefix.size())));
+      return true;
+    } catch (const std::exception &) {
+      return false;
+    }
+  }
+
+  static bool parse_double_token(
+    const std::string & token,
+    const std::string & key,
+    double & value)
+  {
+    const auto prefix = key + "=";
+    if (token.rfind(prefix, 0) != 0U) {
+      return false;
+    }
+    try {
+      value = std::stod(token.substr(prefix.size()));
+      return true;
+    } catch (const std::exception &) {
+      return false;
+    }
+  }
+
+  static std::unordered_map<std::string, BridgeTxRouteStats> parse_bridge_tx_stats(
+    const std::string & text)
+  {
+    // rov_mavlink_node 发布的是一行 String 统计，格式保持轻量，便于终端记录。
+    // 测试节点只解析自己需要的 route=endpoint:msgid 项，不反向依赖 bridge 内部结构。
+    std::unordered_map<std::string, BridgeTxRouteStats> parsed;
+    std::istringstream iss(text);
+    std::string token;
+    std::string current_route;
+
+    while (iss >> token) {
+      if (token == "mavlink_bridge_tx_stats") {
+        continue;
+      }
+      if (token.rfind("route=", 0) == 0U) {
+        current_route = token.substr(std::string("route=").size());
+        parsed[current_route] = BridgeTxRouteStats{};
+        continue;
+      }
+      if (current_route.empty()) {
+        continue;
+      }
+
+      auto & stats = parsed[current_route];
+      uint64_t u64_value = 0;
+      double double_value = 0.0;
+      if (parse_u64_token(token, "win_ok", u64_value)) {
+        stats.win_ok = u64_value;
+      } else if (parse_u64_token(token, "win_fail", u64_value)) {
+        stats.win_fail = u64_value;
+      } else if (parse_u64_token(token, "win_bytes", u64_value)) {
+        stats.win_bytes = u64_value;
+      } else if (parse_double_token(token, "win_fail_pct", double_value)) {
+        stats.win_fail_pct = double_value;
+      } else if (parse_u64_token(token, "total_ok", u64_value)) {
+        stats.total_ok = u64_value;
+      } else if (parse_u64_token(token, "total_fail", u64_value)) {
+        stats.total_fail = u64_value;
+      } else if (parse_u64_token(token, "total", u64_value)) {
+        stats.total = u64_value;
+      } else if (parse_u64_token(token, "bytes", u64_value)) {
+        stats.bytes = u64_value;
+      }
+    }
+    return parsed;
+  }
+
+  void bridge_tx_stats_callback(const std_msgs::msg::String::SharedPtr msg)
+  {
+    const auto parsed = parse_bridge_tx_stats(msg->data);
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    bridge_tx_stats_ = parsed;
+    bridge_tx_stats_raw_ = msg->data;
+    bridge_tx_stats_steady_ms_ = steady_now_ms();
+    bridge_tx_stats_received_ = true;
   }
 
   template<typename MessageT, typename FillT>
@@ -757,7 +929,7 @@ private:
           record_stream_sample_locked(
             brief_tx_stream_quality_, endpoint_name, msgid, sample_ms, false, 0U);
         }
-        publish_event(tx_event_pub_, "TX ROS->STM32", endpoint_name, msgid, topic, count);
+        publish_event(tx_event_pub_, "TX TestNode->BridgeTopic", endpoint_name, msgid, topic, count);
       }});
   }
 
@@ -775,7 +947,7 @@ private:
     auto sub = create_subscription<MessageT>(
       source_topic,
       100,
-      [this, mirror_pub, endpoint_name = endpoint.name, msgid, out_topic](
+      [this, mirror_pub, endpoint_cfg = endpoint, endpoint_name = endpoint.name, msgid, out_topic](
         typename MessageT::SharedPtr msg) {
         if (mirror_pub) {
           mirror_pub->publish(*msg);
@@ -800,11 +972,22 @@ private:
             true,
             static_cast<uint32_t>(msg->timestamp_ms));
           auto & quality = endpoint_quality_[endpoint_name];
-          quality.last_rx = std::chrono::steady_clock::now();
+          const auto link_now = std::chrono::steady_clock::now();
+          quality.last_rx = link_now;
           quality.last_rx_msgid = msgid;
           if (!quality.linked) {
             quality.linked = true;
             ++quality.link_up_count;
+            snapshot_endpoint_counts_locked(endpoint_cfg, last_brief_tx_counts_, last_brief_rx_counts_);
+            snapshot_endpoint_counts_locked(endpoint_cfg, last_tx_counts_, last_rx_counts_);
+            reset_endpoint_stream_windows_locked(
+              endpoint_cfg, tx_stream_quality_, rx_stream_quality_);
+            reset_endpoint_stream_windows_locked(
+              endpoint_cfg, brief_tx_stream_quality_, brief_rx_stream_quality_);
+            quality.brief_window_start = link_now;
+            quality.detail_window_start = link_now;
+            quality.brief_baseline_initialized = true;
+            quality.detail_baseline_initialized = true;
             RCLCPP_INFO(
               get_logger(),
               "%sMAVLink test LINK UP endpoint=%s first_rx_msgid=%u%s",
@@ -814,7 +997,7 @@ private:
               kLogReset);
           }
         }
-        publish_event(rx_event_pub_, "RX STM32->ROS", endpoint_name, msgid, out_topic, count);
+        publish_event(rx_event_pub_, "RX BridgeTopic->TestNode", endpoint_name, msgid, out_topic, count);
       });
     rx_subscriptions_.push_back(sub);
   }
@@ -1025,24 +1208,10 @@ private:
   void brief_timer_callback()
   {
     const auto now = std::chrono::steady_clock::now();
-    const auto elapsed = std::chrono::duration<double>(now - last_brief_time_).count();
-    if (elapsed <= 0.0) {
-      return;
-    }
-    if (skip_next_brief_report_) {
-      std::lock_guard<std::mutex> lock(stats_mutex_);
-      last_brief_tx_counts_ = tx_counts_;
-      last_brief_rx_counts_ = rx_counts_;
-      reset_stream_windows_locked(brief_tx_stream_quality_, brief_rx_stream_quality_);
-      last_brief_time_ = now;
-      skip_next_brief_report_ = false;
-      return;
-    }
-
     std_msgs::msg::String summary;
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(2);
-    oss << "mavlink_quality_brief window=" << elapsed << "s";
+    oss << "mavlink_quality_brief";
     {
       std::lock_guard<std::mutex> lock(stats_mutex_);
       update_link_states_locked(now);
@@ -1050,7 +1219,7 @@ private:
       std::size_t online_count = 0U;
       if (log_quality_report_) {
         log_oss << "\n" << kLogCyan
-                << banner_line("ROV MAVLink COMM BRIEF (win=" + seconds_text(elapsed) + ")")
+                << banner_line("ROV MAVLink COMM BRIEF")
                 << kLogReset << "\n"
                 << format_link_status_block_locked(now) << "\n>>>\n";
       }
@@ -1059,6 +1228,19 @@ private:
         const auto rx_age_ms = rx_age_ms_locked(quality, now);
         const auto state = link_state_locked(quality, now);
         if (state != "UP") {
+          continue;
+        }
+        if (!quality.brief_baseline_initialized) {
+          snapshot_endpoint_counts_locked(endpoint, last_brief_tx_counts_, last_brief_rx_counts_);
+          reset_endpoint_stream_windows_locked(
+            endpoint, brief_tx_stream_quality_, brief_rx_stream_quality_);
+          quality.brief_window_start = now;
+          quality.brief_baseline_initialized = true;
+          continue;
+        }
+        const auto elapsed =
+          std::chrono::duration<double>(now - quality.brief_window_start).count();
+        if (elapsed <= 0.0) {
           continue;
         }
 
@@ -1086,12 +1268,13 @@ private:
 
         oss << " endpoint=" << endpoint.name
             << " state=" << state
+            << " window=" << elapsed << "s"
             << " rx_age_ms=" << rx_age_ms
-            << " tx_ros_to_stm32=(total=" << tx_summary.total
+            << " tx_testnode_to_bridge_topic=(total=" << tx_summary.total
             << " rate=" << tx_summary.rate_hz
             << "Hz missed=" << tx_summary.missed
             << " loss=" << tx_summary.loss_pct << "% msg=(" << tx_summary.messages << "))"
-            << " rx_stm32_to_ros=(total=" << rx_summary.total
+            << " rx_bridge_topic_to_testnode=(total=" << rx_summary.total
             << " rate=" << rx_summary.rate_hz
             << "Hz missed=" << rx_summary.missed
             << " loss=" << rx_summary.loss_pct << "% msg=(" << rx_summary.messages << "))";
@@ -1107,6 +1290,10 @@ private:
             rx_summary);
           log_oss << repeat_char('-', 132U) << "\n";
         }
+        snapshot_endpoint_counts_locked(endpoint, last_brief_tx_counts_, last_brief_rx_counts_);
+        reset_endpoint_stream_windows_locked(
+          endpoint, brief_tx_stream_quality_, brief_rx_stream_quality_);
+        quality.brief_window_start = now;
       }
       if (log_quality_report_) {
         if (online_count == 0U) {
@@ -1115,28 +1302,19 @@ private:
         log_oss << "<<<";
         RCLCPP_INFO(get_logger(), "%s", log_oss.str().c_str());
       }
-      last_brief_tx_counts_ = tx_counts_;
-      last_brief_rx_counts_ = rx_counts_;
-      reset_stream_windows_locked(brief_tx_stream_quality_, brief_rx_stream_quality_);
     }
     summary.data = oss.str();
     quality_summary_pub_->publish(summary);
     legacy_rx_summary_pub_->publish(summary);
-    last_brief_time_ = now;
   }
 
   void detail_timer_callback()
   {
     const auto now = std::chrono::steady_clock::now();
-    const auto elapsed = std::chrono::duration<double>(now - last_detail_time_).count();
-    if (elapsed <= 0.0) {
-      return;
-    }
-
     std_msgs::msg::String report;
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(2);
-    oss << "mavlink_quality_detail window=" << elapsed << "s";
+    oss << "mavlink_quality_detail";
     {
       std::lock_guard<std::mutex> lock(stats_mutex_);
       update_link_states_locked(now);
@@ -1144,7 +1322,7 @@ private:
       std::size_t online_count = 0U;
       if (log_quality_report_) {
         log_oss << "\n" << kLogCyan
-                << banner_line("ROV MAVLink Test Quality (win=" + seconds_text(elapsed) + ")")
+                << banner_line("ROV MAVLink Test Quality")
                 << kLogReset << "\n"
                 << format_link_status_block_locked(now) << "\n>>>\n";
       }
@@ -1153,6 +1331,18 @@ private:
         const auto rx_age_ms = rx_age_ms_locked(quality, now);
         const auto state = link_state_locked(quality, now);
         if (state != "UP") {
+          continue;
+        }
+        if (!quality.detail_baseline_initialized) {
+          snapshot_endpoint_counts_locked(endpoint, last_tx_counts_, last_rx_counts_);
+          reset_endpoint_stream_windows_locked(endpoint, tx_stream_quality_, rx_stream_quality_);
+          quality.detail_window_start = now;
+          quality.detail_baseline_initialized = true;
+          continue;
+        }
+        const auto elapsed =
+          std::chrono::duration<double>(now - quality.detail_window_start).count();
+        if (elapsed <= 0.0) {
           continue;
         }
 
@@ -1180,12 +1370,13 @@ private:
 
         oss << " endpoint=" << endpoint.name
             << " state=" << state
+            << " window=" << elapsed << "s"
             << " rx_age_ms=" << rx_age_ms
-            << " tx_ros_to_stm32=(total=" << tx_summary.total
+            << " tx_testnode_to_bridge_topic=(total=" << tx_summary.total
             << " rate=" << tx_summary.rate_hz
             << "Hz missed=" << tx_summary.missed
             << " loss=" << tx_summary.loss_pct << "% msg=(" << tx_summary.messages << "))"
-            << " rx_stm32_to_ros=(total=" << rx_summary.total
+            << " rx_bridge_topic_to_testnode=(total=" << rx_summary.total
             << " rate=" << rx_summary.rate_hz
             << "Hz missed=" << rx_summary.missed
             << " loss=" << rx_summary.loss_pct << "% msg=(" << rx_summary.messages << "))";
@@ -1201,6 +1392,9 @@ private:
             rx_summary);
           log_oss << repeat_char('-', 132U) << "\n";
         }
+        snapshot_endpoint_counts_locked(endpoint, last_tx_counts_, last_rx_counts_);
+        reset_endpoint_stream_windows_locked(endpoint, tx_stream_quality_, rx_stream_quality_);
+        quality.detail_window_start = now;
       }
       if (log_quality_report_) {
         if (online_count == 0U) {
@@ -1209,14 +1403,9 @@ private:
         log_oss << "<<<";
         RCLCPP_INFO(get_logger(), "%s", log_oss.str().c_str());
       }
-      last_tx_counts_ = tx_counts_;
-      last_rx_counts_ = rx_counts_;
-      reset_stream_windows_locked(tx_stream_quality_, rx_stream_quality_);
-      skip_next_brief_report_ = true;
     }
     report.data = oss.str();
     quality_report_pub_->publish(report);
-    last_detail_time_ = now;
   }
 
   RateSummary build_rate_summary_locked(
@@ -1396,6 +1585,84 @@ private:
     return oss.str();
   }
 
+  std::string format_bridge_tx_stats_block(const TestEndpoint & endpoint) const
+  {
+    std::ostringstream oss;
+    oss << kLogYellow << "EP" << endpoint.system_id
+        << " Bridge UDP sendto: " << kLogReset;
+
+    if (!subscribe_bridge_tx_stats_) {
+      oss << "disabled\n";
+      return oss.str();
+    }
+    if (!bridge_tx_stats_received_) {
+      oss << "waiting for " << bridge_tx_stats_topic_ << "\n";
+      return oss.str();
+    }
+
+    const auto age_ms = steady_now_ms() >= bridge_tx_stats_steady_ms_ ?
+      steady_now_ms() - bridge_tx_stats_steady_ms_ : 0ULL;
+    oss << "topic=" << bridge_tx_stats_topic_ << " age=" << age_ms << "ms\n";
+
+    bool any = false;
+    uint64_t endpoint_win_ok = 0;
+    uint64_t endpoint_win_fail = 0;
+    uint64_t endpoint_total_ok = 0;
+    uint64_t endpoint_total_fail = 0;
+    for (const auto msgid : endpoint.tx) {
+      if (msgid == 0U && !include_heartbeat_tx_) {
+        continue;
+      }
+      const auto it = bridge_tx_stats_.find(stats_key(endpoint.name, msgid));
+      if (it == bridge_tx_stats_.end()) {
+        continue;
+      }
+      any = true;
+      const auto & stats = it->second;
+      endpoint_win_ok += stats.win_ok;
+      endpoint_win_fail += stats.win_fail;
+      endpoint_total_ok += stats.total_ok;
+      endpoint_total_fail += stats.total_fail;
+    }
+
+    const auto endpoint_window_total = endpoint_win_ok + endpoint_win_fail;
+    const auto endpoint_fail_pct = endpoint_window_total == 0U ? 0.0 :
+      static_cast<double>(endpoint_win_fail) * 100.0 / static_cast<double>(endpoint_window_total);
+    oss << "  total win_ok=" << std::setw(8) << endpoint_win_ok
+        << " win_fail=" << std::setw(6) << endpoint_win_fail
+        << " fail=" << std::fixed << std::setprecision(2) << std::setw(6) << endpoint_fail_pct
+        << "% total_ok=" << endpoint_total_ok
+        << " total_fail=" << endpoint_total_fail << "\n";
+
+    if (!any) {
+      oss << "      - no route stats for this endpoint yet\n";
+      return oss.str();
+    }
+
+    for (const auto msgid : endpoint.tx) {
+      if (msgid == 0U && !include_heartbeat_tx_) {
+        continue;
+      }
+      const auto it = bridge_tx_stats_.find(stats_key(endpoint.name, msgid));
+      if (it == bridge_tx_stats_.end()) {
+        oss << "      - " << std::left << std::setw(20) << msgid_label(msgid)
+            << std::right << " no bridge route sample\n";
+        continue;
+      }
+      const auto & stats = it->second;
+      oss << "      - " << std::left << std::setw(20) << msgid_label(msgid)
+          << std::right
+          << " win_ok=" << std::setw(8) << stats.win_ok
+          << " win_fail=" << std::setw(6) << stats.win_fail
+          << " fail=" << std::fixed << std::setprecision(2) << std::setw(6)
+          << stats.win_fail_pct << "%"
+          << " total_ok=" << std::setw(8) << stats.total_ok
+          << " total_fail=" << std::setw(6) << stats.total_fail
+          << " bytes=" << stats.bytes << "\n";
+    }
+    return oss.str();
+  }
+
   std::string format_quality_brief_block(
     const TestEndpoint & endpoint,
     const std::string & state,
@@ -1416,8 +1683,8 @@ private:
         << " rx_age=" << rx_age_ms << "ms"
         << " last_rx_msgid=" << quality.last_rx_msgid
         << " link_up/down=" << quality.link_up_count << "/" << quality.link_down_count << "\n"
-        << format_stream_block(endpoint, "TX ROS->STM32", tx_summary, elapsed, true)
-        << format_stream_block(endpoint, "RX STM32->ROS", rx_summary, elapsed, true);
+        << format_stream_block(endpoint, "TX TestNode->BridgeTopic", tx_summary, elapsed, true)
+        << format_stream_block(endpoint, "RX BridgeTopic->TestNode", rx_summary, elapsed, true);
     return oss.str();
   }
 
@@ -1440,8 +1707,9 @@ private:
         << " rx_age=" << rx_age_ms << "ms"
         << " last_rx_msgid=" << quality.last_rx_msgid
         << " link_up/down=" << quality.link_up_count << "/" << quality.link_down_count << "\n"
-        << format_stream_block(endpoint, "TX ROS->STM32", tx_summary, elapsed, true)
-        << format_stream_block(endpoint, "RX STM32->ROS", rx_summary, elapsed, true);
+        << format_stream_block(endpoint, "TX TestNode->BridgeTopic", tx_summary, elapsed, true)
+        << format_bridge_tx_stats_block(endpoint)
+        << format_stream_block(endpoint, "RX BridgeTopic->TestNode", rx_summary, elapsed, true);
     return oss.str();
   }
 
@@ -1493,8 +1761,9 @@ private:
   bool log_quality_report_{true};
   bool publish_per_message_events_{false};
   bool publish_rx_mirror_topics_{false};
-  bool skip_next_brief_report_{false};
   bool safe_mode_{true};
+  bool subscribe_bridge_tx_stats_{true};
+  std::string bridge_tx_stats_topic_{"/rov_mavlink_node/tx_stats"};
   uint32_t tx_period_ms_{1000};
   uint32_t tx_scheduler_period_ms_{5};
   uint32_t tx_route_stagger_ms_{5};
@@ -1520,14 +1789,17 @@ private:
   std::unordered_map<std::string, StreamQuality> tx_stream_quality_;
   std::unordered_map<std::string, StreamQuality> rx_stream_quality_;
   std::unordered_map<std::string, EndpointQuality> endpoint_quality_;
-  std::chrono::steady_clock::time_point last_brief_time_{};
-  std::chrono::steady_clock::time_point last_detail_time_{};
+  std::unordered_map<std::string, BridgeTxRouteStats> bridge_tx_stats_;
+  bool bridge_tx_stats_received_{false};
+  uint64_t bridge_tx_stats_steady_ms_{0};
+  std::string bridge_tx_stats_raw_;
 
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr rx_event_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr tx_event_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr quality_summary_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr quality_report_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr legacy_rx_summary_pub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr bridge_tx_stats_sub_;
   rclcpp::TimerBase::SharedPtr tx_timer_;
   rclcpp::TimerBase::SharedPtr brief_timer_;
   rclcpp::TimerBase::SharedPtr detail_timer_;

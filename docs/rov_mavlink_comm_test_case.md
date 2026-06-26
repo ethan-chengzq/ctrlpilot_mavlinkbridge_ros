@@ -241,6 +241,8 @@ ros2 run sealien_ctrlpilot_mavlinkbridge rov_mavlink_test_node --ros-args \
   -p detail_report_period_sec:=60 \
   -p quality_link_timeout_ms:=3000 \
   -p log_quality_report:=true \
+  -p subscribe_bridge_tx_stats:=true \
+  -p bridge_tx_stats_topic:=/rov_mavlink_node/tx_stats \
   -p safe_mode:=true \
   -p include_heartbeat_tx:=false
 ```
@@ -250,10 +252,12 @@ ros2 run sealien_ctrlpilot_mavlinkbridge rov_mavlink_test_node --ros-args \
 - `rov_mavlink_test_node` 不直接收发 UDP。
 - 它向 `rov/to_mcu/<endpoint>/<message>` 发布测试 ROS 消息，由 `rov_mavlink_node` 转为 MAVLink UDP 下发。
 - 它订阅 `rov/from_mcu/<endpoint>/<message>`，统计并镜像下位机上发消息。
+- 它默认订阅 `/rov_mavlink_node/tx_stats`，把 bridge 实际 `sendto` 成功/失败计数追加到 60 秒详细报告中。
 - `use_stress_rates=true` 时，测试节点按 MSGID 分频发布：心跳 `1 Hz`，`IMU_DATA/DVL_DATA/THRUSTER_CMD` 为 `50 Hz`，其它状态和命令为 `10 Hz`。
 - `brief_report_period_sec=5` 表示每 5 秒输出通信质量简报；`detail_report_period_sec=60` 表示每 1 分钟输出详细报告。
 - `quality_report_period_sec` 为兼容旧参数保留；新测试建议显式设置 `brief_report_period_sec` 和 `detail_report_period_sec`。
-- `include_heartbeat_tx=false` 时，测试节点不额外发布心跳；ROS bridge 自身会按 YAML `tx: [0]` 向 endpoint 定时发送心跳。
+- 单独手动启动 `rov_mavlink_test_node` 时，如未关闭 `rov_mavlink_node` 的 bridge-owned 心跳，建议保持 `include_heartbeat_tx=false`，避免同一 endpoint 收到两路 `HEARTBEAT#00`。
+- 使用 `rov_mavlink_test.launch.py` 做标准压测时，launch 默认 `bridge_heartbeat_host_tx_hz:=0.0`、`include_heartbeat_tx:=true`，由测试节点统一发布和统计 `HEARTBEAT#00`，这样 ROS 与 STM32 两端 TX/RX 质量口径一致。
 
 测试 102 节点：
 
@@ -310,7 +314,8 @@ ros2 launch sealien_ctrlpilot_mavlinkbridge rov_mavlink_test.launch.py \
   brief_report_period_sec:=5 \
   detail_report_period_sec:=60 \
   safe_mode:=true \
-  include_heartbeat_tx:=false
+  bridge_heartbeat_host_tx_hz:=0.0 \
+  include_heartbeat_tx:=true
 ```
 
 脚本启动方式：
@@ -384,9 +389,10 @@ ros2 topic hz /rov/from_mcu/nav_sensor_mcu/imu_data
 
 方向命名先统一说明：
 
-- ROS 测试节点日志中的 `TX ROS->STM32` 表示测试节点发布 ROS topic，经 bridge 下发到 STM32。
-- ROS 测试节点日志中的 `RX STM32->ROS` 表示 bridge 已经收到 STM32 MAVLink 帧并发布到 ROS topic。
-- STM32 日志中的 `TX STM32->ROS` 表示 STM32 上发 MAVLink。
+- ROS 测试节点日志中的 `TX TestNode->BridgeTopic` 表示测试节点按计划向 `rov/to_mcu/*` 发布 ROS topic。该字段只证明测试激励已进入 ROS topic 层，不等同于 UDP 已经发出或 STM32 已经收到。
+- ROS 测试节点详细报告中的 `Bridge UDP sendto` 表示 `rov_mavlink_node` 对每条下发路由执行 `sendto` 后记录的真实成功/失败计数。
+- ROS 测试节点日志中的 `RX BridgeTopic->TestNode` 表示 bridge 已经收到 STM32 MAVLink 帧并发布到 `rov/from_mcu/*` topic，测试节点已在 ROS topic 层接收。
+- STM32 日志中的 `TX STM32->ROS` 表示 STM32 周期 pack 回调已生成并交给 mavproxy 的上行 MAVLink；当前固件未把底层 UDP `send` 成功/失败逐条并入该表，真实上行到达质量需以 ROS `RX BridgeTopic->TestNode` 交叉验证。
 - STM32 日志中的 `RX ROS->STM32` 表示 STM32 收到 ROS bridge 下发的 MAVLink。
 
 ### 8.1 ROS bridge 日志
@@ -412,7 +418,7 @@ ros2 topic hz /rov/from_mcu/nav_sensor_mcu/imu_data
 | `/rov/test/tx_events` | 每次测试节点发布下行测试 topic 时产生一条事件；压力测试默认 `publish_per_message_events=false`，需要逐帧事件时再打开。 |
 | `/rov/test/rx_events` | 每次测试节点收到 bridge 发布的上行 topic 时产生一条事件；压力测试默认 `publish_per_message_events=false`，需要逐帧事件时再打开。 |
 | `/rov/test/quality_summary` | 5 秒通信质量简报，适合长期 echo 或记录日志。 |
-| `/rov/test/quality_report` | 60 秒详细通信质量报告，包含每个 MSGID 的窗口帧数、丢包率、帧间隔和 jitter。 |
+| `/rov/test/quality_report` | 60 秒详细通信质量报告，包含每个 MSGID 的窗口帧数、丢包率、帧间隔，并追加 bridge UDP `sendto` 统计。 |
 | `/rov/test/rx_summary` | 兼容旧版本的 5 秒简报 topic，内容与 `quality_summary` 同步。 |
 | `/rov/test/from_mcu/<endpoint>/<msg>` | 测试节点镜像的上行数据，便于与正式 `from_mcu` topic 分开观察。 |
 
@@ -427,14 +433,13 @@ ros2 topic hz /rov/from_mcu/nav_sensor_mcu/imu_data
 | `state=UP` | 最近一次接收时间未超过超时阈值。 |
 | `state=DOWN` | 曾经收到过数据，但现在超时。 |
 | `rx_age_ms` | 距离最近一次上行 topic 的时间。 |
-| `tx_ros_to_stm32` | ROS 测试节点已发布的下行消息总数和频率。 |
-| `rx_stm32_to_ros` | ROS 测试节点已收到的上行消息总数和频率。 |
+| `tx_testnode_to_bridge_topic` | ROS 测试节点已发布到 bridge 下发 topic 的消息总数和频率；用于衡量测试激励调度，不代表端到端送达。 |
+| `rx_bridge_topic_to_testnode` | ROS 测试节点已从 bridge 上行 topic 收到的消息总数和频率。 |
+| `Bridge UDP sendto` | bridge 实际 UDP 发送成功/失败计数；下行端到端质量还需与 STM32 `RX ROS->STM32` 统计交叉核对。 |
 | `win=A/B` | 当前窗口内实际帧数/期望帧数。 |
 | `missed` | 由目标频率推算的当前窗口缺帧数。 |
-| `loss` | 当前窗口缺帧率。ROS 侧 TX loss 表示测试节点自身调度缺帧，真实 ROS->STM32 到达质量以 STM32 RX 报告为准。 |
-| `local_gap` | 本端相邻帧接收或发布间隔的 avg/min/max。 |
-| `remote_gap` | 对端 `timestamp_ms` 推算的相邻帧间隔；仅对携带时间戳且被解析的消息显示。 |
-| `jitter` | `local_gap` 与 `remote_gap` 的差值统计，用于观察链路/调度抖动。 |
+| `loss` | 当前窗口缺帧率。测试节点 TX loss 只表示测试节点发布调度缺帧；真实 ROS->STM32 到达质量以 `Bridge UDP sendto` 和 STM32 RX 报告共同判断。 |
+| `gap avg/min/max` | 本端相邻帧接收或发布间隔。 |
 
 ROS 端 5 秒通信质量简报示例：
 
@@ -443,11 +448,11 @@ ROS 端 5 秒通信质量简报示例：
 [LinkStatus] online(2/3): nav_sensor_mcu(192.168.100.101:9999), actuator_mcu(192.168.100.102:9999)
 >>>
 [endpoint] actuator_mcu: peer=192.168.100.102:9999 sysid=102 compid=1 state=UP(OK) window=5.00s rx_age=7ms last_rx_msgid=4 link_up/down=1/0
-EP102 TX ROS->STM32: total=    5958 window=  459/500 rate=  91.80/100.00Hz missed=    41 loss=  8.20%
-      -- THRUSTER_CMD#10      total=     250 win=  250/250 rate=  50.00/ 50.00Hz missed=     0 loss=  0.00%
-EP102 RX STM32->ROS: total=   62570 window=  205/205 rate=  41.00/ 41.00Hz missed=     0 loss=  0.00%
-      -- HEARTBEAT#0          total=    2979 win=      5/5 rate=   1.00/  1.00Hz missed=     0 loss=  0.00%
-         THRUSTER_STATUS#2    total=     500 win=    50/50 rate=  10.00/ 10.00Hz missed=     0 loss=  0.00%
+EP102 TX TestNode->BridgeTopic: total=    5958 window=  459/500 rate=  91.80/100.00Hz missed=    41 loss=  8.20%
+      - THRUSTER_CMD#10      total=     250 win=  250/250 rate=  50.00/ 50.00Hz missed=     0 loss=  0.00% gap avg/min/max=20.00/19/21ms
+EP102 RX BridgeTopic->TestNode: total=   62570 window=  205/205 rate=  41.00/ 41.00Hz missed=     0 loss=  0.00%
+      - HEARTBEAT#00         total=    2979 win=      5/5 rate=   1.00/  1.00Hz missed=     0 loss=  0.00% gap avg/min/max=1000.00/999/1001ms
+      - THRUSTER_STATUS#02   total=     500 win=    50/50 rate=  10.00/ 10.00Hz missed=     0 loss=  0.00% gap avg/min/max=100.00/99/101ms
 ------------------------------------------------------------------------------------------------------------------------------------
 <<<
 ```
@@ -458,10 +463,10 @@ EP102 RX STM32->ROS: total=   62570 window=  205/205 rate=  41.00/ 41.00Hz misse
 | --- | --- | --- |
 | `ROV MAVLink test endpoint=... sysid=... compid=... uplink=... downlink=...` | 测试任务启动，显示当前固件身份和消息集合数量。 | 若 endpoint 与预期不一致，重新修改并编译 `ROV_MAVTEST_ACTIVE_ENDPOINT`。 |
 | `MAVLink LINK UP` | STM32 收到 ROS 主机合法下行帧，host 链路置为 UP。 | 若 ROS 已启动但没有该日志，查 ROS 下发 topic、IP 和端口。 |
-| `TX STM32->ROS tx msgid=... period=...Hz` | STM32 注册的周期上发消息及频率。 | 与 YAML `messages.rx` 对照。 |
+| `TX STM32->ROS tx msgid=... period=...Hz` | STM32 注册的周期上发消息及频率；质量表计数点在 pack 回调。 | 与 YAML `messages.rx` 和 ROS RX 统计对照，确认端到端到达。 |
 | `RX ROS->STM32 rx msgid=... expected=...Hz` | STM32 允许接收的下行 MSGID 及期望频率。 | 与 YAML `messages.tx` 和 ROS 压力频率表对照。 |
 | `ROV MAVLink COMM BRIEF` | STM32 每 5 秒输出一次通信质量简报。 | 看 `window=A/B`、`missed`、`loss` 是否异常。 |
-| `ROV MAVLink COMM DETAIL` | STM32 每 60 秒输出一次详细通信质量报告。 | 看每个 MSGID 的 `window=A/B`、`loss`、`local_gap`、`remote_gap`、`jitter`。 |
+| `ROV MAVLink COMM DETAIL` | STM32 每 60 秒输出一次详细通信质量报告。 | 看每个 MSGID 的 `window=A/B`、`loss`、`gap avg/min/max`。 |
 | `heartbeat ts=... type=... status=... ver=...` | 最近一次收到 ROS bridge 心跳的内容。 | 若 heartbeat 计数不增长，查 YAML tx 是否包含 `0`。 |
 | `MAVLink LINK DOWN` | STM32 超过 `ROV_MAVTEST_HOST_TIMEOUT_MS` 未收到 ROS 下行帧。 | 查 ROS bridge 是否仍在运行，或测试节点/bridge 心跳是否关闭。 |
 | `drop msgid=... not allowed for endpoint ...` | STM32 收到 ROS 帧，但该 MSGID 不属于当前 endpoint 的 downlink allowlist。 | 查 ROS target endpoint 和 YAML tx。 |
@@ -629,8 +634,8 @@ heartbeat ts=... type=... status=... ver=...
 
 说明：
 
-- 即使 `rov_mavlink_test_node` 的 `include_heartbeat_tx=false`，`rov_mavlink_node` 也会根据 YAML 中 `tx` 包含 `0` 自动发送心跳。
-- 若要专门验证 ROS Topic 方式下发 `MSGID 0`，可将测试节点参数改为 `include_heartbeat_tx:=true`，但此时 bridge 心跳和测试心跳会同时存在。
+- 默认正式通信下，`rov_mavlink_node` 会根据 YAML 中 `tx` 包含 `0` 自动发送心跳。
+- 标准压测 launch 会将 `bridge_heartbeat_host_tx_hz:=0.0` 并启用 `include_heartbeat_tx:=true`，避免 bridge 心跳与测试节点心跳重复，同时将 `HEARTBEAT#00` 纳入测试节点 TX 统计。
 
 ### TC-07 路由限制检查
 
