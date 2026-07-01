@@ -70,6 +70,7 @@ install(TARGETS
 
 install(PROGRAMS
   scripts/start_rov_mavlink_test.sh
+  scripts/start_rov_mavlink_long_test.sh
   DESTINATION lib/${PROJECT_NAME}
 )
 
